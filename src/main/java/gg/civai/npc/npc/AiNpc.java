@@ -56,6 +56,12 @@ public class AiNpc {
     // Prevents overlapping Ollama calls
     private volatile boolean thinkingLock = false;
 
+    // Queued @mention — stored when thinkingLock is busy, fired after think completes.
+    // Only the most recent @mention is kept; older ones are overwritten.
+    private String   pendingPlayerName = null;
+    private String   pendingMessage    = null;
+    private Location pendingPlayerLoc  = null;
+
     public AiNpc(AiNpcPlugin plugin, OllamaClient ollamaClient, String name, int scanRadius) {
         this.plugin       = plugin;
         this.ollamaClient = ollamaClient;
@@ -129,7 +135,16 @@ public class AiNpc {
             if (entity == null || !entity.isValid()) return;
             if (!entity.getWorld().equals(playerLoc.getWorld())) return;
             if (entity.getLocation().distance(playerLoc) > scanRadius) return;
-            if (thinkingLock) return;
+
+            if (thinkingLock) {
+                // Ollama is busy — queue this mention so it fires when the current think finishes.
+                // Most-recent-wins: overwrite any previously queued mention.
+                pendingPlayerName = playerName;
+                pendingMessage    = message;
+                pendingPlayerLoc  = playerLoc;
+                logger.info("[" + name + "] @mention queued (busy): " + playerName + ": " + message);
+                return;
+            }
 
             runThink(playerName, message, playerLoc);
         });
@@ -160,7 +175,7 @@ public class AiNpc {
                     + " | action: " + action.type
                     + (action.speech != null ? " | speech: \"" + action.speech + "\"" : ""));
 
-            // Back on main thread: apply + record in memory
+            // Back on main thread: apply + record in memory + drain any queued @mention
             plugin.getServer().getScheduler().runTask(plugin, () -> {
                 applyAction(action);
 
@@ -169,6 +184,18 @@ public class AiNpc {
                 }
 
                 thinkingLock = false;
+
+                // If a player @mentioned while we were busy, respond now
+                if (pendingPlayerName != null) {
+                    String pName = pendingPlayerName;
+                    String pMsg  = pendingMessage;
+                    Location pLoc = pendingPlayerLoc;
+                    pendingPlayerName = null;
+                    pendingMessage    = null;
+                    pendingPlayerLoc  = null;
+                    logger.info("[" + name + "] firing queued @mention from " + pName);
+                    runThink(pName, pMsg, pLoc);
+                }
             });
         });
     }

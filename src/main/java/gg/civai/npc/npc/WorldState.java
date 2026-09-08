@@ -115,19 +115,18 @@ public class WorldState {
           .append(" z=").append(Math.round(z)).append("\n");
         sb.append("World: ").append(world).append("\n");
 
-        // Time
-        sb.append("Time: ").append(timeLabel)
-          .append(" (tick ").append(rawTick).append(", ")
-          .append(isDay ? "daytime" : "nighttime").append(")\n");
-        sb.append("Time until: sunrise ~").append(minUntilSunrise)
-          .append("min, noon ~").append(minUntilNoon)
-          .append("min, sunset ~").append(minUntilSunset)
-          .append("min, midnight ~").append(minUntilMidnight).append("min\n");
-
-        // Weather
-        sb.append("Weather: ").append(weatherState).append("\n");
+        // Time — formatted as a bullet block so small models can copy the numbers directly
+        sb.append("\n[TIME - use these EXACT numbers, do not invent your own]\n");
+        sb.append("  Currently: ").append(timeLabel)
+          .append(", ").append(isDay ? "daytime" : "nighttime").append("\n");
+        sb.append("  Weather: ").append(weatherState).append("\n");
+        sb.append("  Sunset in:   ").append(minUntilSunset).append(" real minutes\n");
+        sb.append("  Midnight in: ").append(minUntilMidnight).append(" real minutes\n");
+        sb.append("  Sunrise in:  ").append(minUntilSunrise).append(" real minutes\n");
+        sb.append("  Noon in:     ").append(minUntilNoon).append(" real minutes\n");
 
         // Players
+        sb.append("\n");
         if (!nearbyPlayers.isEmpty()) {
             sb.append("Nearby players: ").append(String.join(", ", nearbyPlayers)).append("\n");
         } else {

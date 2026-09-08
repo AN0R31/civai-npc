@@ -192,6 +192,10 @@ Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD 
 - 50-block movement cap per decision
 - `config.yml` (runtime, gitignored) + `config.example.yml` (committed)
 
+### v1.1.2 — 2026-09-08 — Time accuracy fix, @mention queue
+- **Time hallucination fix** (`WorldState.toPromptString`): time facts now formatted as a labelled block with `[TIME - use these EXACT numbers, do not invent your own]` header and one line per event (sunset/midnight/sunrise/noon) so small models copy the values directly instead of guessing
+- **@mention queue** (`AiNpc`): when `thinkingLock` is held (periodic tick in flight), the @mention is now queued (most-recent-wins) instead of silently dropped; fires automatically when the current think completes; logged as "queued" / "firing queued" for visibility
+
 ### v1.1.1 — 2026-09-08 — Speech fix, terrain movement
 - **Speech fix**: rewrote system prompt to be shorter and more directive for 8B models; `HARD RULES` section forces non-null speech on PRIORITY messages; action descriptions simplified
 - **Player location in PRIORITY block**: player's XYZ is now included so the model can use correct coords for MOVE_AND_SPEAK
