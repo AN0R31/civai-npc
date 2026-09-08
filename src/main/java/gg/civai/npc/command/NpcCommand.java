@@ -13,10 +13,10 @@ import org.bukkit.entity.Player;
 public class NpcCommand implements CommandExecutor {
 
     private final AiNpcPlugin plugin;
-    private final NpcManager npcManager;
+    private final NpcManager  npcManager;
 
     public NpcCommand(AiNpcPlugin plugin, NpcManager npcManager) {
-        this.plugin = plugin;
+        this.plugin     = plugin;
         this.npcManager = npcManager;
     }
 
@@ -32,16 +32,23 @@ public class NpcCommand implements CommandExecutor {
             return true;
         }
 
-        if (args.length == 0) {
-            sendHelp(player);
-            return true;
-        }
+        if (args.length == 0) { sendHelp(player); return true; }
 
         switch (args[0].toLowerCase()) {
+
             case "spawn" -> {
+                String npcName = plugin.getConfig().getString("npc.name", "SuperSteve");
+                if (npcManager.hasNpc(npcName)) {
+                    player.sendMessage(Component.text(
+                            npcName + " is already active or saved. Use /ainpc remove first.",
+                            NamedTextColor.RED));
+                    return true;
+                }
                 AiNpc npc = npcManager.spawnAt(player.getLocation());
-                player.sendMessage(Component.text("Spawned " + npc.getName() + " at your location.", NamedTextColor.GREEN));
+                player.sendMessage(Component.text(
+                        "Spawned " + npc.getName() + " at your location.", NamedTextColor.GREEN));
             }
+
             case "remove" -> {
                 boolean removed = npcManager.removeNearest(player.getLocation());
                 if (removed) {
@@ -50,23 +57,28 @@ public class NpcCommand implements CommandExecutor {
                     player.sendMessage(Component.text("No AI NPC found nearby.", NamedTextColor.RED));
                 }
             }
+
             case "status" -> {
                 var npcs = npcManager.getNpcs();
                 if (npcs.isEmpty()) {
                     player.sendMessage(Component.text("No AI NPCs active.", NamedTextColor.GRAY));
                 } else {
                     for (AiNpc npc : npcs) {
-                        var loc = npc.getLocation();
+                        var loc    = npc.getLocation();
                         var action = npc.getCurrentAction();
+                        int memSize  = npc.getMemory().size();
+                        int memCap   = npc.getMemory().capacity();
                         player.sendMessage(Component.text(
-                            "[" + npc.getName() + "] " +
-                            String.format("pos=(%.1f,%.1f,%.1f) ", loc.getX(), loc.getY(), loc.getZ()) +
-                            "action=" + action.type + " thought=\"" + action.thought + "\"",
-                            NamedTextColor.AQUA
-                        ));
+                                "[" + npc.getName() + "] "
+                                + String.format("pos=(%.1f,%.1f,%.1f) ", loc.getX(), loc.getY(), loc.getZ())
+                                + "action=" + action.type + " "
+                                + "memory=" + memSize + "/" + memCap + " "
+                                + "thought=\"" + action.thought + "\"",
+                                NamedTextColor.AQUA));
                     }
                 }
             }
+
             default -> sendHelp(player);
         }
 
@@ -75,8 +87,8 @@ public class NpcCommand implements CommandExecutor {
 
     private void sendHelp(Player player) {
         player.sendMessage(Component.text("--- AI NPC Commands ---", NamedTextColor.GOLD));
-        player.sendMessage(Component.text("/ainpc spawn   - Spawn SuperSteve at your location", NamedTextColor.WHITE));
-        player.sendMessage(Component.text("/ainpc remove  - Remove nearest AI NPC", NamedTextColor.WHITE));
-        player.sendMessage(Component.text("/ainpc status  - Show NPC status and current action", NamedTextColor.WHITE));
+        player.sendMessage(Component.text("/ainpc spawn   - Spawn NPC at your location (warns if already exists)", NamedTextColor.WHITE));
+        player.sendMessage(Component.text("/ainpc remove  - Remove nearest AI NPC (also deletes save)", NamedTextColor.WHITE));
+        player.sendMessage(Component.text("/ainpc status  - Show NPC status, action, and memory count", NamedTextColor.WHITE));
     }
 }

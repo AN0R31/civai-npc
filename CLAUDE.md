@@ -31,8 +31,8 @@ A **Paper Minecraft plugin** (Java) that spawns AI-powered NPCs driven by a **lo
 - **Maven**: 3.9.9 at `/usr/share/maven`
 - **JAVA_HOME must be set**: `export JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64`
 - **Build command**: `cd /opt/civai-npc && mvn package`
-- **Output jar**: `target/ai-npc-1.0.0.jar`
-- **Deploy**: `cp target/ai-npc-1.0.0.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
+- **Output jar**: `target/ai-npc-1.1.0.jar`
+- **Deploy**: `cp target/ai-npc-1.1.0.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
 
 ---
 
@@ -51,16 +51,18 @@ A **Paper Minecraft plugin** (Java) that spawns AI-powered NPCs driven by a **lo
 
 ```
 gg.civai.npc
-├── AiNpcPlugin.java          # JavaPlugin entry point, wires everything together
+├── AiNpcPlugin.java              # JavaPlugin entry point, wires everything together
 ├── ai/
-│   └── OllamaClient.java     # HTTP POST to Ollama /api/chat, parses JSON response into NpcAction
+│   └── OllamaClient.java         # HTTP POST to Ollama /api/chat, parses JSON response into NpcAction
 ├── command/
-│   └── NpcCommand.java       # /ainpc spawn|remove|status
+│   └── NpcCommand.java           # /ainpc spawn|remove|status
 └── npc/
-    ├── AiNpc.java            # Core NPC: spawns Villager entity, runs game tick + AI tick
-    ├── NpcAction.java        # Enum + data class for AI decisions (IDLE/SPEAK/MOVE_TO/MOVE_AND_SPEAK)
-    ├── NpcManager.java       # Manages list of NPCs, listens for player chat + interact events
-    └── WorldState.java       # Scans surroundings, builds prompt string for Ollama
+    ├── AiNpc.java                # Core NPC: spawns Villager entity, game tick + AI tick + memory
+    ├── ConversationMemory.java   # Circular buffer of last 10 player↔NPC exchanges (v1.1)
+    ├── NpcAction.java            # Enum + data class (IDLE/SPEAK/MOVE_TO/MOVE_AND_SPEAK/REPORT/TIME_REPORT)
+    ├── NpcManager.java           # Manages NPC list, routes @mention vs passive chat
+    ├── NpcPersistenceManager.java# Save/load NPC locations to npcs.yml (v1.1)
+    └── WorldState.java           # Surroundings snapshot + time/weather details for Ollama prompt
 ```
 
 ---
@@ -86,11 +88,19 @@ gg.civai.npc
 - **Timeout**: 60 seconds on the HTTP request (Ollama on 8B model takes 2-10s typically)
 - **Common gotcha**: model name must be exact — `llama3` fails, `llama3:latest` works
 
+### Prompt structure (v1.1):
+```
+## Recent Conversation History        ← last 10 player↔Steve exchanges
+## Recent Nearby Chat                 ← last 5 passive messages (not @Steve)
+## PRIORITY: Direct Message           ← only present on @mention
+=== WORLD STATE ===                   ← position, time, weather, entities
+```
+
 ### Expected JSON response format:
 ```json
 {
   "thought": "internal reasoning string",
-  "action": "IDLE | SPEAK | MOVE_TO | MOVE_AND_SPEAK",
+  "action": "IDLE | SPEAK | MOVE_TO | MOVE_AND_SPEAK | REPORT | TIME_REPORT",
   "speech": "what the NPC says, or null",
   "target_x": 0.0,
   "target_y": 0.0,
@@ -100,26 +110,25 @@ gg.civai.npc
 
 ---
 
-## Current Limitations (as of v1.0.0)
+## Current Limitations (as of v1.1.0)
 
-- **No persistence**: NPCs vanish on server restart, must `/ainpc spawn` again
 - **No pathfinding**: movement is linear interpolation, NPC walks through walls/water
-- **No memory**: each AI tick is stateless — NPC doesn't remember previous interactions
-- **Single personality**: one system prompt for all NPCs
+- **Memory is in-RAM only**: conversation history resets on server restart (persistence coming later)
+- **Single personality**: one system prompt for all NPCs (config-driven profiles planned)
 - **Villager entity only**: appearance is always a vanilla villager
 - **Movement cap**: 50 blocks max per decision to prevent runaway coordinates
+- **Single NPC**: only one NPC (npc.name) is supported; multi-NPC planned
 
 ---
 
 ## Planned Next Steps
 
-1. **Persistence** — save NPC spawn locations to `npcs.yml`, restore on plugin enable
-2. **Conversation memory** — maintain a rolling message history per NPC, inject into prompt
-3. **Pathfinding** — use Paper's pathfinding API or simple obstacle avoidance
-4. **Multiple NPCs with different personalities** — config-driven personality profiles
-5. **Custom skins** — fetch player skin via Mojang API and apply to ArmorStand or NPC lib
-6. **NPC inventory awareness** — include held/nearby items in world state
-7. **Multi-agent** — NPCs aware of each other, can interact
+1. **Pathfinding** — use Paper's pathfinding API or simple obstacle avoidance
+2. **Persist conversation memory** — write memory to `npcs.yml` so it survives restarts
+3. **Multiple NPCs with different personalities** — config-driven personality profiles
+4. **Custom skins** — fetch player skin via Mojang API and apply to ArmorStand or NPC lib
+5. **NPC inventory awareness** — include held/nearby items in world state
+6. **Multi-agent** — NPCs aware of each other, can interact
 
 ---
 
@@ -157,9 +166,11 @@ ollama:
 
 ---
 
-## Git Notes
+## Git / Workflow Rules
 
 - Repo: `https://github.com/AN0R31/civai-npc`
+- **AI assistants must never `git commit`, `git push`, or create branches.** All commits and pushes are done manually by the human after review.
+- Always work directly on `main`. No feature branches.
 - `config.yml` is gitignored (contains real LAN IP)
 - `config.example.yml` is committed with placeholder values
 - `target/` is gitignored
@@ -167,11 +178,39 @@ ollama:
 
 ---
 
+## Changelog
+
+Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD — summary`.
+
+### v1.0.0 — 2026-09-08 — Initial release
+- Plugin scaffolded: `AiNpcPlugin`, `AiNpc`, `NpcManager`, `NpcAction`, `WorldState`, `OllamaClient`, `NpcCommand`
+- Villager-based NPC with vanilla AI disabled
+- Linear-interpolation movement (game tick every 200 ms)
+- Ollama `/api/chat` integration, `llama3:latest`, stream=false, 60 s timeout
+- JSON action schema: `IDLE | SPEAK | MOVE_TO | MOVE_AND_SPEAK`
+- `/ainpc spawn|remove|status` commands
+- 50-block movement cap per decision
+- `config.yml` (runtime, gitignored) + `config.example.yml` (committed)
+
+### v1.1.0 — 2026-09-08 — Persistence, Memory, @mention, improved AI context
+- **Persistence** (`NpcPersistenceManager`): spawn location saved to `npcs.yml`; NPCs auto-restored on plugin enable; `/ainpc remove` cleans persistence; `/ainpc spawn` warns if already saved
+- **Self-detection fix** (`WorldState`): NPC UUID filtered from entity scan — Steve no longer sees himself
+- **Rolling memory** (`ConversationMemory`): circular buffer of last 10 `{player, playerMsg, steveResponse}` entries; injected into Ollama prompt as "## Recent Conversation History"; in-RAM only
+- **Passive chat log** (`AiNpc`): last 5 non-directed nearby messages stored per-NPC; injected as "## Recent Nearby Chat"; Steve observes without immediately reacting
+- **@mention model** (`NpcManager`): `AsyncPlayerChatEvent` → Paper `AsyncChatEvent`; `@Steve <msg>` triggers immediate async Ollama call; other messages go to passive log; right-click handler removed
+- **Immediate response** (`AiNpc.triggerImmediateResponse`): skips AI tick queue via `thinkingLock`; proximity-checked on main thread
+- **New actions** (`NpcAction`): `REPORT` (narrate surroundings) and `TIME_REPORT` (answer time/weather naturally)
+- **Richer world state** (`WorldState`): full tick value, minutes-until-{sunrise,noon,sunset,midnight}, weather (clear/rain/thunder), day/night boolean
+- **Updated system prompt** (`OllamaClient`): NPC name parameterised; REPORT/TIME_REPORT documented; IDLE restricted to truly idle situations; prompt injection order: memory → passive chat → priority message → world state
+- **`/ainpc status`** now shows memory fill (e.g. `memory=3/10`)
+
+---
+
 ## Useful Commands
 
 ```bash
 # Build and deploy in one line
-cd /opt/civai-npc && mvn package && cp target/ai-npc-1.0.0.jar \
+cd /opt/civai-npc && mvn package && cp target/ai-npc-1.1.0.jar \
   /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/
 
 # Test Ollama reachability
