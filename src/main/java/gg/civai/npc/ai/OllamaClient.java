@@ -7,6 +7,7 @@ import com.google.gson.JsonParser;
 import gg.civai.npc.npc.ConversationMemory;
 import gg.civai.npc.npc.NpcAction;
 import gg.civai.npc.npc.WorldState;
+import org.bukkit.Location;
 
 import java.io.IOException;
 import java.net.URI;
@@ -20,43 +21,44 @@ import java.util.logging.Logger;
 public class OllamaClient {
 
     // -------------------------------------------------------------------------
-    // System prompt template — %s is replaced with the NPC name on construction
+    // System prompt — %s is replaced with the NPC name
+    // Kept short and direct: small models (8B) follow simple rules better.
     // -------------------------------------------------------------------------
     private static final String SYSTEM_PROMPT_TEMPLATE = """
         You are %s, an AI villager living in a Minecraft world.
-        You have a curious, friendly, slightly dramatic personality.
-        You explore, react to your environment, and chat naturally with players.
+        You are curious, friendly, and chatty. You talk naturally with players.
 
-        You will receive a world state snapshot. Before it you may see:
-          - "## Recent Conversation History" — your past exchanges with players
-          - "## Recent Nearby Chat" — things players said nearby (not directed at you)
-          - "## PRIORITY: Direct Message" — a player is talking directly to you RIGHT NOW
-
-        Respond ONLY with a valid JSON object in exactly this format:
+        You receive a world state snapshot every ~10 seconds.
+        Respond with ONLY this JSON object, nothing else:
         {
-          "thought": "your internal reasoning (1-2 sentences)",
-          "action": "IDLE | MOVE_TO | SPEAK | MOVE_AND_SPEAK | REPORT | TIME_REPORT",
-          "speech": "what you say out loud, or null if silent",
+          "thought": "1-2 sentences of internal reasoning",
+          "action": "IDLE | SPEAK | MOVE_TO | MOVE_AND_SPEAK | REPORT | TIME_REPORT",
+          "speech": "what you say out loud, or null",
           "target_x": 0.0,
           "target_y": 0.0,
           "target_z": 0.0
         }
 
-        Action rules:
-        - IDLE         — stay put, say nothing. Use ONLY when truly nothing is happening and no one is talking to you.
-        - MOVE_TO      — walk to target coordinates (set target_x/y/z).
-        - SPEAK        — say something without moving. Use when responding to nearby events.
-        - MOVE_AND_SPEAK — walk and talk at the same time (set target_x/y/z).
-        - REPORT       — narrate what you observe around you in first person, naturally. No movement.
-        - TIME_REPORT  — answer a time or weather question using the precomputed time values in the world state.
-                         Express the answer naturally and in character (e.g. "The sun sets in about 3 minutes —
-                         you'd better find shelter!" not raw tick numbers). No movement needed.
+        ACTION GUIDE:
+        - IDLE          → silent, stay put. Use ONLY when alone and nothing is happening.
+        - SPEAK         → say something without moving. Use when a player is talking to you.
+        - MOVE_TO       → walk somewhere silently. Do NOT use if a player spoke to you.
+        - MOVE_AND_SPEAK → walk to target coords + say something. Good for approaching a player.
+        - REPORT        → narrate what you see around you out loud. Set speech to your narration.
+        - TIME_REPORT   → answer a time or weather question with natural in-character speech.
+                          Use the precomputed time values from the world state (minutes until
+                          sunrise/noon/sunset/midnight). Express naturally, e.g.:
+                          "Sunset is in about 3 minutes — better find shelter!"
+                          Never output raw tick numbers. No movement needed.
 
-        When a player sends you a PRIORITY message, you MUST respond with SPEAK, MOVE_AND_SPEAK, or
-        TIME_REPORT — never IDLE. Acknowledge what they said and stay in character.
-
-        Keep all speech natural, in-character, max 1-2 sentences.
-        Do not include any text outside the JSON object.
+        HARD RULES — follow every time:
+        1. If you see a "## PRIORITY" section, a player just spoke to you directly.
+           You MUST set speech to a non-null reply and use SPEAK, MOVE_AND_SPEAK, or TIME_REPORT.
+           NEVER use IDLE or silent MOVE_TO when a player directly addressed you.
+        2. Weather question → TIME_REPORT with speech describing current weather.
+        3. Time/sunset/sunrise/noon question → TIME_REPORT with speech using the minute values.
+        4. No text outside the JSON object.
+        5. Speech: max 2 short sentences. Stay in character as a friendly Minecraft villager.
         """;
 
     private final String     systemPrompt;
@@ -81,20 +83,21 @@ public class OllamaClient {
     // -------------------------------------------------------------------------
 
     /**
-     * Sends the world state (plus memory and optional direct message) to Ollama
-     * and returns a parsed NpcAction.
-     *
+     * Sends world state + memory + optional direct-message context to Ollama.
      * Blocking — always call from an async thread.
      *
-     * @param state             current world snapshot
-     * @param memory            rolling conversation history (may be empty)
-     * @param directPlayerName  null for periodic ticks; player name for @mention responses
-     * @param directMessage     null for periodic ticks; stripped @mention text
+     * @param state               current world snapshot
+     * @param memory              rolling conversation history
+     * @param directPlayerName    null for periodic ticks; player name for @mention
+     * @param directMessage       null for periodic ticks; stripped @mention text
+     * @param directPlayerLoc     null for periodic ticks; player location for MOVE_AND_SPEAK hint
      */
     public NpcAction think(WorldState state, ConversationMemory memory,
-                           String directPlayerName, String directMessage) {
+                           String directPlayerName, String directMessage,
+                           Location directPlayerLoc) {
         try {
-            String userContent = buildUserPrompt(state, memory, directPlayerName, directMessage);
+            String userContent = buildUserPrompt(state, memory, directPlayerName,
+                                                 directMessage, directPlayerLoc);
 
             JsonObject body = new JsonObject();
             body.addProperty("model", model);
@@ -126,10 +129,12 @@ public class OllamaClient {
                     .timeout(Duration.ofSeconds(60))
                     .build();
 
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = httpClient.send(request,
+                    HttpResponse.BodyHandlers.ofString());
 
             if (response.statusCode() != 200) {
-                logger.warning("Ollama returned HTTP " + response.statusCode() + ": " + response.body());
+                logger.warning("Ollama returned HTTP " + response.statusCode()
+                        + ": " + response.body());
                 return NpcAction.idle("Ollama error, staying put.");
             }
 
@@ -146,7 +151,8 @@ public class OllamaClient {
     // -------------------------------------------------------------------------
 
     private String buildUserPrompt(WorldState state, ConversationMemory memory,
-                                   String directPlayerName, String directMessage) {
+                                   String directPlayerName, String directMessage,
+                                   Location directPlayerLoc) {
         StringBuilder sb = new StringBuilder();
 
         // 1. Rolling conversation history
@@ -155,7 +161,8 @@ public class OllamaClient {
             sb.append("## Recent Conversation History\n");
             for (ConversationMemory.Entry e : entries) {
                 sb.append("[").append(e.playerName()).append("]: ").append(e.playerMessage())
-                  .append(" → [").append(state.npcName).append("]: ").append(e.steveResponse()).append("\n");
+                  .append(" → [").append(state.npcName).append("]: ")
+                  .append(e.steveResponse()).append("\n");
             }
             sb.append("\n");
         }
@@ -169,11 +176,17 @@ public class OllamaClient {
             sb.append("\n");
         }
 
-        // 3. Priority direct message (from @mention)
+        // 3. Priority direct message — most important, placed just before world state
         if (directPlayerName != null && directMessage != null) {
-            sb.append("## PRIORITY: Direct Message\n");
-            sb.append(directPlayerName).append(" is talking directly to you: \"").append(directMessage).append("\"\n");
-            sb.append("You MUST respond with SPEAK, MOVE_AND_SPEAK, or TIME_REPORT — do NOT use IDLE.\n\n");
+            sb.append("## PRIORITY: ").append(directPlayerName)
+              .append(" is talking directly to you\n");
+            sb.append("Their message: \"").append(directMessage).append("\"\n");
+            if (directPlayerLoc != null) {
+                sb.append("Their position: x=").append(Math.round(directPlayerLoc.getX()))
+                  .append(" y=").append(Math.round(directPlayerLoc.getY()))
+                  .append(" z=").append(Math.round(directPlayerLoc.getZ())).append("\n");
+            }
+            sb.append("YOU MUST reply — use SPEAK, MOVE_AND_SPEAK, or TIME_REPORT with non-null speech.\n\n");
         }
 
         // 4. World state

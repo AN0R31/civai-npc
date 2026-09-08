@@ -5,6 +5,8 @@ import gg.civai.npc.ai.OllamaClient;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Location;
+import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.entity.Villager;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -21,6 +23,12 @@ import java.util.logging.Logger;
  *  - Passive chat log (last 5 nearby messages not directed at Steve)
  *  - Immediate Ollama call when a player @mentions Steve
  *  - Self UUID passed to WorldState so Steve doesn't see himself
+ *  - Player location forwarded to OllamaClient so MOVE_AND_SPEAK knows where to go
+ *
+ * Movement (v1.1 patch):
+ *  - Terrain-following via getHighestBlockYAt
+ *  - Simple 1-block step-up for obstacles (fences, walls)
+ *  - Cliff guard: stops if ground delta > 3 blocks
  */
 public class AiNpc {
 
@@ -35,17 +43,17 @@ public class AiNpc {
     private Location targetLocation;
 
     // State
-    private NpcAction           currentAction = NpcAction.idle("Just spawned.");
+    private NpcAction            currentAction = NpcAction.idle("Just spawned.");
     private final ConversationMemory memory    = new ConversationMemory(10);
 
-    // Passive chat log — written from async thread, read from main thread
+    // Passive chat log — written from async thread, accessed from main thread
     private final ArrayDeque<String> recentChatLog = new ArrayDeque<>(5);
 
     // Scheduler handles
     private BukkitTask gameTick;
     private BukkitTask aiTick;
 
-    // Prevents overlapping Ollama calls (regular tick + immediate response)
+    // Prevents overlapping Ollama calls
     private volatile boolean thinkingLock = false;
 
     public AiNpc(AiNpcPlugin plugin, OllamaClient ollamaClient, String name, int scanRadius) {
@@ -100,7 +108,7 @@ public class AiNpc {
             if (entity == null || !entity.isValid()) return;
             if (thinkingLock) return; // immediate response in flight — skip this tick
 
-            runThink(null, null); // regular periodic tick (no direct message)
+            runThink(null, null, null); // periodic tick — no direct message
         }, 20L, intervalTicks);
     }
 
@@ -110,35 +118,34 @@ public class AiNpc {
 
     /**
      * Fires an immediate Ollama call when a player @mentions Steve.
-     * Safe to call from an async thread — schedules actual work on main thread.
+     * Safe to call from an async thread — all entity access is deferred to main thread.
      *
-     * @param playerName   the player who mentioned Steve
-     * @param message      the message content (prefix already stripped)
-     * @param playerLoc    snapshot of player location for proximity check
+     * @param playerName  the player who mentioned Steve
+     * @param message     message content (prefix already stripped)
+     * @param playerLoc   snapshot of player location for proximity check + prompt hint
      */
     public void triggerImmediateResponse(String playerName, String message, Location playerLoc) {
-        // Jump to main thread for entity access + lock check
         plugin.getServer().getScheduler().runTask(plugin, () -> {
             if (entity == null || !entity.isValid()) return;
-            // Only respond if the player is within scan radius
             if (!entity.getWorld().equals(playerLoc.getWorld())) return;
             if (entity.getLocation().distance(playerLoc) > scanRadius) return;
-            if (thinkingLock) return; // already processing something
+            if (thinkingLock) return;
 
-            runThink(playerName, message);
+            runThink(playerName, message, playerLoc);
         });
     }
 
     /**
      * Core async think dispatch.
      *
-     * @param directPlayerName  null for periodic ticks; set when responding to an @mention
+     * @param directPlayerName  null for periodic ticks
      * @param directMessage     null for periodic ticks; the stripped @mention text
+     * @param directPlayerLoc   null for periodic ticks; player location passed to prompt
      */
-    private void runThink(String directPlayerName, String directMessage) {
+    private void runThink(String directPlayerName, String directMessage, Location directPlayerLoc) {
         thinkingLock = true;
 
-        // Snapshot chat log (main thread, so no lock needed for the deque)
+        // Snapshot chat log on main thread
         List<String> chatSnapshot = new ArrayList<>(recentChatLog);
 
         WorldState state = new WorldState(
@@ -147,14 +154,16 @@ public class AiNpc {
 
         // Async: call Ollama (blocking HTTP)
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
-            NpcAction action = ollamaClient.think(state, memory, directPlayerName, directMessage);
-            logger.info("[" + name + "] thought: " + action.thought);
+            NpcAction action = ollamaClient.think(
+                    state, memory, directPlayerName, directMessage, directPlayerLoc);
+            logger.info("[" + name + "] thought: " + action.thought
+                    + " | action: " + action.type
+                    + (action.speech != null ? " | speech: \"" + action.speech + "\"" : ""));
 
-            // Back on main thread: apply + record
+            // Back on main thread: apply + record in memory
             plugin.getServer().getScheduler().runTask(plugin, () -> {
                 applyAction(action);
 
-                // Record in memory if this was a direct exchange
                 if (directPlayerName != null && action.speech != null) {
                     memory.add(directPlayerName, directMessage, action.speech);
                 }
@@ -170,10 +179,9 @@ public class AiNpc {
 
     /**
      * Called from async thread when a player sends a message NOT directed at Steve.
-     * Adds it to the passive chat log (max 5 entries).
+     * Adds to the passive chat log if the player is within scan radius.
      */
     public synchronized void onPassiveChat(String logEntry, Location playerLoc) {
-        // Distance check using last-known entity location — safe read from async thread
         if (entity == null || !entity.isValid()) return;
         Location npcLoc = entity.getLocation();
         if (!npcLoc.getWorld().equals(playerLoc.getWorld())) return;
@@ -192,7 +200,8 @@ public class AiNpc {
 
         switch (action.type) {
             case MOVE_TO, MOVE_AND_SPEAK -> {
-                Location target = new Location(entity.getWorld(), action.targetX, action.targetY, action.targetZ);
+                Location target = new Location(
+                        entity.getWorld(), action.targetX, action.targetY, action.targetZ);
                 if (entity.getLocation().distance(target) < 50) {
                     targetLocation = target;
                 }
@@ -209,25 +218,81 @@ public class AiNpc {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Movement — terrain-following with step-up
+    // -------------------------------------------------------------------------
+
     private void executeMovement() {
         if (targetLocation == null) return;
         Location current = entity.getLocation();
-        double dist = current.distance(targetLocation);
-        if (dist < 0.5) return;
+
+        // Horizontal-only distance for "arrived" check
+        double dx = targetLocation.getX() - current.getX();
+        double dz = targetLocation.getZ() - current.getZ();
+        double xzDist = Math.sqrt(dx * dx + dz * dz);
+        if (xzDist < 0.5) return;
 
         double speed = 0.2;
-        double dx = targetLocation.getX() - current.getX();
-        double dy = targetLocation.getY() - current.getY();
-        double dz = targetLocation.getZ() - current.getZ();
-        double len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        double scale = Math.min(speed, xzDist) / xzDist;
+        double nx = current.getX() + dx * scale;
+        double nz = current.getZ() + dz * scale;
 
-        double nx = current.getX() + (dx / len) * Math.min(speed, dist);
-        double nz = current.getZ() + (dz / len) * Math.min(speed, dist);
+        World w  = current.getWorld();
+        int bx   = (int) Math.floor(nx);
+        int bz2  = (int) Math.floor(nz);
+        int byFeet = (int) Math.floor(current.getY()); // block at foot level
 
-        Location next = new Location(current.getWorld(), nx, current.getY(), nz,
+        double ny = resolveY(w, bx, bz2, byFeet, current.getY());
+        if (Double.isNaN(ny)) return; // obstacle with no step-up available
+
+        // Cliff guard — don't jump or fall more than 3 blocks per step
+        if (Math.abs(ny - current.getY()) > 3.0) return;
+
+        Location next = new Location(w, nx, ny, nz,
                 (float) Math.toDegrees(Math.atan2(-dx, dz)), 0f);
         entity.teleport(next);
     }
+
+    /**
+     * Determines the Y the NPC should stand at after stepping to (bx, bz).
+     *
+     * Strategy:
+     *  1. If the destination column is clear at current foot height → stay on ground.
+     *     If the block under the new position is air → step down to the highest solid block.
+     *  2. If the destination foot block is impassable → try to step up one block.
+     *  3. If that's also blocked → return NaN (stay put).
+     *
+     * @param byFeet  the block-Y at the NPC's current feet level (floor of entity Y)
+     * @param currentY entity Y (may be fractional)
+     */
+    private double resolveY(World w, int bx, int bz, int byFeet, double currentY) {
+        Block foot  = w.getBlockAt(bx, byFeet, bz);
+        Block head  = w.getBlockAt(bx, byFeet + 1, bz);
+        Block under = w.getBlockAt(bx, byFeet - 1, bz);
+
+        if (foot.isPassable() && head.isPassable()) {
+            // Path is clear — check if ground dropped away
+            if (under.isPassable()) {
+                // Ground dropped; find solid surface
+                int groundY = w.getHighestBlockYAt(bx, bz);
+                return groundY + 1.0;
+            }
+            return currentY; // flat or slight terrain, keep Y
+        }
+
+        // Foot is blocked — try stepping up one block
+        Block stepFoot = w.getBlockAt(bx, byFeet + 1, bz);
+        Block stepHead = w.getBlockAt(bx, byFeet + 2, bz);
+        if (stepFoot.isPassable() && stepHead.isPassable()) {
+            return byFeet + 1.0;
+        }
+
+        return Double.NaN; // completely blocked
+    }
+
+    // -------------------------------------------------------------------------
+    // Utilities
+    // -------------------------------------------------------------------------
 
     private void speak(String message) {
         if (entity == null || !entity.isValid()) return;
@@ -236,10 +301,6 @@ public class AiNpc {
                         .append(Component.text(message, NamedTextColor.WHITE))));
     }
 
-    // -------------------------------------------------------------------------
-    // Accessors
-    // -------------------------------------------------------------------------
-
     public boolean     isValid()         { return entity != null && entity.isValid(); }
     public Location    getLocation()     { return entity != null ? entity.getLocation() : null; }
     public String      getName()         { return name; }
@@ -247,6 +308,7 @@ public class AiNpc {
     public ConversationMemory getMemory(){ return memory; }
 
     private String formatLoc(Location l) {
-        return String.format("(%.1f, %.1f, %.1f) in %s", l.getX(), l.getY(), l.getZ(), l.getWorld().getName());
+        return String.format("(%.1f, %.1f, %.1f) in %s",
+                l.getX(), l.getY(), l.getZ(), l.getWorld().getName());
     }
 }

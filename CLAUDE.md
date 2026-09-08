@@ -192,6 +192,12 @@ Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD 
 - 50-block movement cap per decision
 - `config.yml` (runtime, gitignored) + `config.example.yml` (committed)
 
+### v1.1.1 — 2026-09-08 — Speech fix, terrain movement
+- **Speech fix**: rewrote system prompt to be shorter and more directive for 8B models; `HARD RULES` section forces non-null speech on PRIORITY messages; action descriptions simplified
+- **Player location in PRIORITY block**: player's XYZ is now included so the model can use correct coords for MOVE_AND_SPEAK
+- **Improved log**: `think()` now logs `action` and `speech` alongside thought, so you can see what Steve actually chose
+- **Terrain-following movement** (`AiNpc.resolveY`): NPC uses block passability + `getHighestBlockYAt` to follow terrain; simple 1-block step-up for fences/walls; cliff guard (stops if ground delta > 3 blocks)
+
 ### v1.1.0 — 2026-09-08 — Persistence, Memory, @mention, improved AI context
 - **Persistence** (`NpcPersistenceManager`): spawn location saved to `npcs.yml`; NPCs auto-restored on plugin enable; `/ainpc remove` cleans persistence; `/ainpc spawn` warns if already saved
 - **Self-detection fix** (`WorldState`): NPC UUID filtered from entity scan — Steve no longer sees himself
