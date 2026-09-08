@@ -31,8 +31,8 @@ A **Paper Minecraft plugin** (Java) that spawns AI-powered NPCs driven by a **lo
 - **Maven**: 3.9.9 at `/usr/share/maven`
 - **JAVA_HOME must be set**: `export JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64`
 - **Build command**: `cd /opt/civai-npc && mvn package`
-- **Output jar**: `target/ai-npc-1.1.0.jar`
-- **Deploy**: `cp target/ai-npc-1.1.0.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
+- **Output jar**: `target/ai-npc-1.1.2.jar`
+- **Deploy**: `cp target/ai-npc-1.1.2.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
 
 ---
 
@@ -220,7 +220,7 @@ Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD 
 
 ```bash
 # Build and deploy in one line
-cd /opt/civai-npc && mvn package && cp target/ai-npc-1.1.0.jar \
+cd /opt/civai-npc && mvn package && cp target/ai-npc-1.1.2.jar \
   /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/
 
 # Test Ollama reachability
