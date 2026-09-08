@@ -1,0 +1,17 @@
+name: ai-npc
+version: 1.0.0
+main: gg.civai.npc.AiNpcPlugin
+api-version: '1.21'
+description: AI-powered NPC using local Ollama
+authors: [civai]
+
+commands:
+  ainpc:
+    description: AI NPC commands
+    usage: /ainpc <spawn|remove|status>
+    permission: ainpc.admin
+
+permissions:
+  ainpc.admin:
+    description: Manage AI NPCs
+    default: op

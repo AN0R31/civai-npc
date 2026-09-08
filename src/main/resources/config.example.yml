@@ -1,0 +1,12 @@
+# AI NPC Configuration
+npc:
+  name: "SuperSteve"
+  skin: "Steve"
+  scan-radius: 10        # blocks to scan around NPC
+  game-tick-ms: 200      # movement update interval in ms
+  ai-tick-seconds: 10    # how often to query Ollama
+
+ollama:
+  host: "http://192.168.1.102:11434"   # update to your Ollama LXC IP
+  model: "llama3.1"
+  timeout-seconds: 30
