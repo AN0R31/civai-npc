@@ -1,13 +1,13 @@
 package gg.civai.npc.npc;
 
 import gg.civai.npc.AiNpcPlugin;
+import gg.civai.npc.ai.LlmDecision;
 import gg.civai.npc.ai.OllamaClient;
+import gg.civai.npc.goal.Goal;
+import gg.civai.npc.goal.GoalEngine;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Location;
-import org.bukkit.Material;
-import org.bukkit.World;
-import org.bukkit.block.Block;
 import org.bukkit.entity.Villager;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -19,17 +19,17 @@ import java.util.logging.Logger;
 /**
  * A single AI-controlled NPC.
  *
- * v1.1 additions:
- *  - ConversationMemory (last 10 exchanges, in-RAM)
- *  - Passive chat log (last 5 nearby messages not directed at Steve)
- *  - Immediate Ollama call when a player @mentions Steve
- *  - Self UUID passed to WorldState so Steve doesn't see himself
- *  - Player location forwarded to OllamaClient so MOVE_AND_SPEAK knows where to go
+ * v1.2 architectural refactor — two-layer AI:
+ *  1. LLM layer (event-driven): Ollama sets a Goal. Called only on events, not a fixed timer.
+ *  2. GoalEngine layer (200ms tick): deterministic local executor for Goals.
  *
- * Movement (v1.1 patch):
- *  - Terrain-following via getHighestBlockYAt
- *  - Simple 1-block step-up for obstacles (fences, walls)
- *  - Cliff guard: stops if ground delta > 3 blocks
+ * The LLM is called when:
+ *  - NPC spawns (startup)
+ *  - A goal completes or fails (GoalEngine callback)
+ *  - A player @mentions the NPC
+ *  - A significant event occurs (threat detected, night fallen, NPC attacked)
+ *
+ * Movement is fully delegated to GoalEngine (removed from this class).
  */
 public class AiNpc {
 
@@ -41,43 +41,30 @@ public class AiNpc {
 
     // Entity
     private Villager entity;
-    private Location targetLocation;
 
-    // State
-    private NpcAction            currentAction = NpcAction.idle("Just spawned.");
-    private final ConversationMemory memory    = new ConversationMemory(10);
+    // Goal engine (created on spawn, handles movement and goal execution)
+    private GoalEngine goalEngine;
 
-    // Persistent activity — what the NPC is currently doing between AI ticks.
-    // Fed back into the prompt each tick so the NPC has continuity of purpose.
-    private String currentActivity = "just arrived, looking around";
+    // Conversation memory
+    private final ConversationMemory memory = new ConversationMemory(10);
 
-    // Speech cooldown — prevents the NPC from narrating its existence every 10 s.
-    // Direct @mentions always bypass this; autonomous speech is gated here.
-    private long   lastSpeechMs             = 0L;
-    private static final long SPEECH_COOLDOWN_MS = 45_000L; // 45 s between unsolicited speech
-
-    // Continuous wander — when true, the game tick picks new sub-targets automatically
-    // whenever the NPC arrives at its destination, so it keeps moving without waiting
-    // for the next Ollama tick. Set by MOVE_TO (autonomous); cleared by IDLE or any
-    // player-directed action.
-    private boolean continuousWander = false;
-    private static final int WANDER_RADIUS = 14; // max blocks from current pos per sub-target
-
-    // Passive chat log — written from async thread, accessed from main thread
+    // Passive chat log — async-safe (synchronized on recentChatLog)
     private final ArrayDeque<String> recentChatLog = new ArrayDeque<>(5);
 
-    // Scheduler handles
+    // Scheduler handle for game tick
     private BukkitTask gameTick;
-    private BukkitTask aiTick;
 
-    // Prevents overlapping Ollama calls
+    // LLM call lock — prevents overlapping Ollama calls
     private volatile boolean thinkingLock = false;
 
-    // Queued @mention — stored when thinkingLock is busy, fired after think completes.
-    // Only the most recent @mention is kept; older ones are overwritten.
-    private String   pendingPlayerName = null;
-    private String   pendingMessage    = null;
-    private Location pendingPlayerLoc  = null;
+    // Queued @mention — stored when thinkingLock is busy, fired after current think completes
+    private volatile String   pendingPlayerName = null;
+    private volatile String   pendingMessage    = null;
+    private volatile Location pendingPlayerLoc  = null;
+
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
 
     public AiNpc(AiNpcPlugin plugin, OllamaClient ollamaClient, String name, int scanRadius) {
         this.plugin       = plugin;
@@ -95,57 +82,76 @@ public class AiNpc {
         entity = location.getWorld().spawn(location, Villager.class, v -> {
             v.customName(Component.text(name, NamedTextColor.YELLOW));
             v.setCustomNameVisible(true);
-            v.setAI(false);              // we control movement
+            v.setAI(false);               // GoalEngine handles all movement
             v.setInvulnerable(true);
-            v.setSilent(true);           // we handle speech
+            v.setSilent(true);            // we handle speech
             v.setRemoveWhenFarAway(false);
         });
 
-        targetLocation = location.clone();
+        // Build GoalEngine with callbacks that re-invoke the LLM
+        goalEngine = new GoalEngine(
+                entity, logger, name, scanRadius,
+                /* onGoalComplete  */ () -> triggerLlmCall("goal_completed", ""),
+                /* onGoalFailed    */ reason -> triggerLlmCall("goal_failed: " + reason, ""),
+                /* onThreatDetected*/ () -> triggerLlmCall("threat_detected", "")
+        );
+
         startGameTick();
-        startAiTick();
+
+        // Fire initial LLM call after a short delay so the world has loaded
+        plugin.getServer().getScheduler().runTaskLater(plugin,
+                () -> triggerLlmCall("startup", ""),
+                40L); // 2-second delay (40 ticks)
+
         logger.info(name + " spawned at " + formatLoc(location));
     }
 
     public void remove() {
         if (gameTick != null) gameTick.cancel();
-        if (aiTick   != null) aiTick.cancel();
-        if (entity != null && entity.isValid()) entity.remove();
+        if (entity   != null && entity.isValid()) entity.remove();
         logger.info(name + " removed.");
     }
 
     // -------------------------------------------------------------------------
-    // Schedulers
+    // Game tick (200 ms) — delegates entirely to GoalEngine
     // -------------------------------------------------------------------------
 
     private void startGameTick() {
         gameTick = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
             if (entity == null || !entity.isValid()) return;
-            executeMovement();
+            goalEngine.tick();
         }, 0L, 4L); // 4 ticks = 200 ms
     }
 
-    private void startAiTick() {
-        long intervalTicks = 20L * plugin.getConfig().getInt("npc.ai-tick-seconds", 10);
-        aiTick = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
-            if (entity == null || !entity.isValid()) return;
-            if (thinkingLock) return; // immediate response in flight — skip this tick
-
-            runThink(null, null, null); // periodic tick — no direct message
-        }, 20L, intervalTicks);
-    }
-
     // -------------------------------------------------------------------------
-    // AI dispatch
+    // LLM dispatch
     // -------------------------------------------------------------------------
 
     /**
-     * Fires an immediate Ollama call when a player @mentions Steve.
-     * Safe to call from an async thread — all entity access is deferred to main thread.
+     * Triggers an LLM call for a world event or GoalEngine callback.
+     * Must be called from the main thread.
      *
-     * @param playerName  the player who mentioned Steve
-     * @param message     message content (prefix already stripped)
-     * @param playerLoc   snapshot of player location for proximity check + prompt hint
+     * @param reason  why the LLM is being called (e.g. "goal_completed", "threat_detected")
+     * @param context additional context string (may be empty)
+     */
+    public void triggerLlmCall(String reason, String context) {
+        if (entity == null || !entity.isValid()) return;
+        if (thinkingLock) {
+            // Don't stack LLM calls from automated events — skip silently.
+            // @mention calls use the queue mechanism; automated events just drop.
+            logger.fine("[" + name + "] LLM busy — skipping event: " + reason);
+            return;
+        }
+        runLlmCall(reason, null, null, null);
+    }
+
+    /**
+     * Fires an immediate LLM call when a player @mentions the NPC.
+     * Safe to call from an async thread — proximity check is deferred to main thread.
+     *
+     * @param playerName  player who mentioned the NPC
+     * @param message     message text (prefix already stripped)
+     * @param playerLoc   snapshot of player location
      */
     public void triggerImmediateResponse(String playerName, String message, Location playerLoc) {
         plugin.getServer().getScheduler().runTask(plugin, () -> {
@@ -154,8 +160,7 @@ public class AiNpc {
             if (entity.getLocation().distance(playerLoc) > scanRadius) return;
 
             if (thinkingLock) {
-                // Ollama is busy — queue this mention so it fires when the current think finishes.
-                // Most-recent-wins: overwrite any previously queued mention.
+                // Queue it — most-recent-wins
                 pendingPlayerName = playerName;
                 pendingMessage    = message;
                 pendingPlayerLoc  = playerLoc;
@@ -163,50 +168,47 @@ public class AiNpc {
                 return;
             }
 
-            runThink(playerName, message, playerLoc);
+            runLlmCall("player_mention", playerName, message, playerLoc);
         });
     }
 
     /**
-     * Core async think dispatch.
+     * Core async LLM dispatch. Must be called from the main thread with thinkingLock == false.
      *
-     * @param directPlayerName  null for periodic ticks
-     * @param directMessage     null for periodic ticks; the stripped @mention text
-     * @param directPlayerLoc   null for periodic ticks; player location passed to prompt
+     * @param reason        reason string passed to OllamaClient
+     * @param mentionPlayer null for non-mention calls
+     * @param mentionMsg    null for non-mention calls
+     * @param mentionLoc    null for non-mention calls
      */
-    private void runThink(String directPlayerName, String directMessage, Location directPlayerLoc) {
+    private void runLlmCall(String reason,
+                            String mentionPlayer, String mentionMsg, Location mentionLoc) {
         thinkingLock = true;
-        boolean isDirect = directPlayerName != null;
+        boolean isMention = mentionPlayer != null;
 
-        // Snapshot mutable state on main thread before going async
-        List<String> chatSnapshot    = new ArrayList<>(recentChatLog);
-        String       activitySnapshot = currentActivity;
+        // Snapshot mutable state on main thread
+        List<String> chatSnapshot = new ArrayList<>(recentChatLog);
+        Goal currentGoal          = goalEngine.getCurrentGoal();
+        long goalElapsed          = goalEngine.getGoalElapsedSeconds();
+        List<String> goalHistory  = goalEngine.getGoalHistory();
 
         WorldState state = new WorldState(
                 entity.getLocation(), scanRadius, name,
-                entity.getUniqueId(), chatSnapshot);
+                entity.getUniqueId(), chatSnapshot,
+                currentGoal, goalElapsed, goalHistory);
 
-        // Async: call Ollama (blocking HTTP)
+        // Async: blocking HTTP call to Ollama
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
-            NpcAction action = ollamaClient.think(
-                    state, memory, directPlayerName, directMessage, directPlayerLoc,
-                    activitySnapshot);
-            logger.info("[" + name + "] activity: " + activitySnapshot
-                    + " → " + action.nextActivity
-                    + " | action: " + action.type
-                    + (action.speech != null ? " | speech: \"" + action.speech + "\"" : ""));
+            LlmDecision decision = ollamaClient.think(
+                    state, memory, reason,
+                    mentionPlayer, mentionMsg, mentionLoc);
 
-            // Back on main thread: apply + record in memory + drain any queued @mention
+            // Back on main thread: apply decision
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                applyAction(action, isDirect);
-
-                if (isDirect && action.speech != null) {
-                    memory.add(directPlayerName, directMessage, action.speech);
-                }
+                applyDecision(decision, isMention, mentionPlayer, mentionMsg);
 
                 thinkingLock = false;
 
-                // If a player @mentioned while we were busy, respond now
+                // Fire queued @mention if any
                 if (pendingPlayerName != null) {
                     String pName = pendingPlayerName;
                     String pMsg  = pendingMessage;
@@ -215,10 +217,27 @@ public class AiNpc {
                     pendingMessage    = null;
                     pendingPlayerLoc  = null;
                     logger.info("[" + name + "] firing queued @mention from " + pName);
-                    runThink(pName, pMsg, pLoc);
+                    runLlmCall("player_mention", pName, pMsg, pLoc);
                 }
             });
         });
+    }
+
+    /**
+     * Applies an LLM decision: sets the new Goal, speaks if the LLM provided speech,
+     * and records @mention exchanges in conversation memory.
+     */
+    private void applyDecision(LlmDecision decision, boolean isMention,
+                               String mentionPlayer, String mentionMsg) {
+        goalEngine.setGoal(decision.goal());
+
+        if (decision.speech() != null && !decision.speech().isBlank()) {
+            speak(decision.speech());
+        }
+
+        if (isMention && mentionPlayer != null && decision.speech() != null) {
+            memory.add(mentionPlayer, mentionMsg, decision.speech());
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -226,8 +245,8 @@ public class AiNpc {
     // -------------------------------------------------------------------------
 
     /**
-     * Called from async thread when a player sends a message NOT directed at Steve.
-     * Adds to the passive chat log if the player is within scan radius.
+     * Called from async thread for messages NOT directed at this NPC.
+     * Adds to passive chat log if the player is within scan radius.
      */
     public synchronized void onPassiveChat(String logEntry, Location playerLoc) {
         if (entity == null || !entity.isValid()) return;
@@ -240,194 +259,26 @@ public class AiNpc {
     }
 
     // -------------------------------------------------------------------------
-    // Action execution
+    // Speech
     // -------------------------------------------------------------------------
 
-    private void applyAction(NpcAction action, boolean isDirectMessage) {
-        currentAction = action;
-
-        // Update persistent activity descriptor for next tick
-        if (action.nextActivity != null && !action.nextActivity.isBlank()) {
-            currentActivity = action.nextActivity;
-        }
-
-        // Any new AI decision resets wander mode; MOVE_TO (autonomous only) re-enables it.
-        continuousWander = false;
-
-        switch (action.type) {
-            case MOVE_TO -> {
-                Location target = new Location(
-                        entity.getWorld(), action.targetX, action.targetY, action.targetZ);
-                if (entity.getLocation().distance(target) < 50) {
-                    targetLocation = target;
-                }
-                // Autonomous MOVE_TO → keep wandering after arrival without waiting for Ollama
-                if (!isDirectMessage) continuousWander = true;
-            }
-            case MOVE_AND_SPEAK -> {
-                Location target = new Location(
-                        entity.getWorld(), action.targetX, action.targetY, action.targetZ);
-                if (entity.getLocation().distance(target) < 50) {
-                    targetLocation = target;
-                }
-                if (action.speech != null) trySpeak(action.speech, isDirectMessage);
-            }
-            case SPEAK, REPORT, TIME_REPORT -> {
-                if (action.speech != null) trySpeak(action.speech, isDirectMessage);
-            }
-            case IDLE -> {
-                // stay put — most common autonomous state
-            }
-        }
-    }
-
-    /**
-     * Speaks out loud, enforcing a cooldown on autonomous (non-directed) speech.
-     * Direct @mention responses always bypass the cooldown.
-     */
-    private void trySpeak(String message, boolean isDirectMessage) {
-        long now = System.currentTimeMillis();
-        if (!isDirectMessage && (now - lastSpeechMs) < SPEECH_COOLDOWN_MS) {
-            logger.fine("[" + name + "] speech suppressed (cooldown): " + message);
-            return;
-        }
-        speak(message);
-        lastSpeechMs = now;
-    }
-
-    // -------------------------------------------------------------------------
-    // Movement — terrain-following with step-up
-    // -------------------------------------------------------------------------
-
-    private void executeMovement() {
-        if (targetLocation == null) return;
-        Location current = entity.getLocation();
-
-        // Horizontal-only distance for "arrived" check
-        double dx = targetLocation.getX() - current.getX();
-        double dz = targetLocation.getZ() - current.getZ();
-        double xzDist = Math.sqrt(dx * dx + dz * dz);
-        if (xzDist < 0.5) {
-            if (continuousWander) pickNextWanderTarget(); // pick next sub-target automatically
-            return;
-        }
-
-        double speed = 0.2;
-        double scale = Math.min(speed, xzDist) / xzDist;
-        double nx = current.getX() + dx * scale;
-        double nz = current.getZ() + dz * scale;
-
-        World w  = current.getWorld();
-        int bx   = (int) Math.floor(nx);
-        int bz2  = (int) Math.floor(nz);
-        int byFeet = (int) Math.floor(current.getY()); // block at foot level
-
-        double ny = resolveY(w, bx, bz2, byFeet, current.getY());
-        if (Double.isNaN(ny)) return; // obstacle with no step-up available
-
-        // Cliff guard — don't jump or fall more than 3 blocks per step
-        if (Math.abs(ny - current.getY()) > 3.0) return;
-
-        Location next = new Location(w, nx, ny, nz,
-                (float) Math.toDegrees(Math.atan2(-dx, dz)), 0f);
-        entity.teleport(next);
-    }
-
-    /**
-     * Determines the Y the NPC should stand at after stepping to (bx, bz).
-     *
-     * Strategy:
-     *  1. If the destination column is clear at current foot height → stay on ground.
-     *     If the block under the new position is air → step down to the highest solid block.
-     *  2. If the destination foot block is impassable → try to step up one block.
-     *  3. If that's also blocked → return NaN (stay put).
-     *
-     * @param byFeet  the block-Y at the NPC's current feet level (floor of entity Y)
-     * @param currentY entity Y (may be fractional)
-     */
-    private double resolveY(World w, int bx, int bz, int byFeet, double currentY) {
-        Block foot  = w.getBlockAt(bx, byFeet, bz);
-        Block head  = w.getBlockAt(bx, byFeet + 1, bz);
-        Block under = w.getBlockAt(bx, byFeet - 1, bz);
-
-        // Never enter liquid — water is isPassable()=true in Bukkit, so must check explicitly
-        if (isLiquid(foot) || isLiquid(head)) return Double.NaN;
-
-        if (foot.isPassable() && head.isPassable()) {
-            // Path is clear — check if ground dropped away
-            if (under.isPassable()) {
-                // Ground dropped; find solid surface
-                int groundY = w.getHighestBlockYAt(bx, bz);
-                // Don't step down into a lake or lava pool
-                if (isLiquid(w.getBlockAt(bx, groundY, bz))) return Double.NaN;
-                return groundY + 1.0;
-            }
-            return currentY; // flat or slight terrain, keep Y
-        }
-
-        // Foot is blocked — try stepping up one block
-        Block stepFoot = w.getBlockAt(bx, byFeet + 1, bz);
-        Block stepHead = w.getBlockAt(bx, byFeet + 2, bz);
-        if (stepFoot.isPassable() && stepHead.isPassable()
-                && !isLiquid(stepFoot) && !isLiquid(stepHead)) {
-            return byFeet + 1.0;
-        }
-
-        return Double.NaN; // completely blocked
-    }
-
-    /**
-     * Picks a random nearby point as the next wander sub-target.
-     * Tries up to 8 candidates; skips any that land on liquid or a steep cliff.
-     * Called from the game tick — runs on the main thread.
-     */
-    private void pickNextWanderTarget() {
-        if (entity == null || !entity.isValid()) return;
-        Location loc = entity.getLocation();
-        World    w   = loc.getWorld();
-
-        for (int attempt = 0; attempt < 8; attempt++) {
-            double angle = Math.random() * 2 * Math.PI;
-            double dist  = 4 + Math.random() * WANDER_RADIUS;
-            int    nx    = (int) Math.floor(loc.getX() + Math.cos(angle) * dist);
-            int    nz    = (int) Math.floor(loc.getZ() + Math.sin(angle) * dist);
-            int    ny    = w.getHighestBlockYAt(nx, nz); // top solid/liquid surface
-
-            // Reject liquid surfaces (lake, ocean, lava)
-            if (isLiquid(w.getBlockAt(nx, ny, nz))) continue;
-            // Reject steep drops or climbs (> 5 blocks from current Y)
-            if (Math.abs(ny - loc.getBlockY()) > 5) continue;
-
-            targetLocation = new Location(w, nx + 0.5, ny + 1.0, nz + 0.5);
-            return;
-        }
-        // All candidates rejected — stop wandering until next Ollama tick decides
-        continuousWander = false;
-    }
-
-    /** Returns true for blocks the NPC should never step into or onto. */
-    private static boolean isLiquid(Block b) {
-        return switch (b.getType()) {
-            case WATER, LAVA, BUBBLE_COLUMN -> true;
-            default -> false;
-        };
-    }
-
-    // -------------------------------------------------------------------------
-    // Utilities
-    // -------------------------------------------------------------------------
-
-    private void speak(String message) {
+    public void speak(String message) {
         if (entity == null || !entity.isValid()) return;
         entity.getWorld().getNearbyPlayers(entity.getLocation(), scanRadius).forEach(p ->
                 p.sendMessage(Component.text("[" + name + "] ", NamedTextColor.YELLOW)
                         .append(Component.text(message, NamedTextColor.WHITE))));
     }
 
-    public boolean     isValid()         { return entity != null && entity.isValid(); }
-    public Location    getLocation()     { return entity != null ? entity.getLocation() : null; }
-    public String      getName()         { return name; }
-    public NpcAction   getCurrentAction(){ return currentAction; }
+    // -------------------------------------------------------------------------
+    // Accessors
+    // -------------------------------------------------------------------------
+
+    public boolean  isValid()            { return entity != null && entity.isValid(); }
+    public Location getLocation()        { return entity != null ? entity.getLocation() : null; }
+    public String   getName()            { return name; }
+    public int      getScanRadius()      { return scanRadius; }
+    public Villager getEntity()          { return entity; }
+    public Goal     getCurrentGoal()     { return goalEngine != null ? goalEngine.getCurrentGoal() : null; }
     public ConversationMemory getMemory(){ return memory; }
 
     private String formatLoc(Location l) {

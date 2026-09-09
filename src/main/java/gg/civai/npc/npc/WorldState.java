@@ -1,5 +1,6 @@
 package gg.civai.npc.npc;
 
+import gg.civai.npc.goal.Goal;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
@@ -13,6 +14,8 @@ import java.util.UUID;
 /**
  * Snapshot of the NPC's surroundings, passed to the AI as a prompt block.
  * The NPC's own UUID is excluded from entity scans so Steve doesn't see himself.
+ *
+ * v1.2: adds goal context (current goal type/status, elapsed time, last 3 goals).
  */
 public class WorldState {
 
@@ -21,13 +24,13 @@ public class WorldState {
     public final String world;
 
     // --- time ---
-    public final long   rawTick;           // 0-23999
-    public final String timeLabel;         // morning / afternoon / evening / night
+    public final long    rawTick;           // 0-23999
+    public final String  timeLabel;         // morning / afternoon / evening / night
     public final boolean isDay;
-    public final long   minUntilSunrise;
-    public final long   minUntilNoon;
-    public final long   minUntilSunset;
-    public final long   minUntilMidnight;
+    public final long    minUntilSunrise;
+    public final long    minUntilNoon;
+    public final long    minUntilSunset;
+    public final long    minUntilMidnight;
 
     // --- weather ---
     public final String weatherState;      // "clear" | "rain" | "thunder"
@@ -41,6 +44,11 @@ public class WorldState {
     public final String       npcName;
     public final List<String> recentChatLog; // passive chat from nearby players
 
+    // --- goal context (v1.2) ---
+    public final String       currentGoalStr;        // e.g. "WANDER(r=20)[ACTIVE]"
+    public final long         goalElapsedSeconds;    // how long current goal has been running
+    public final List<String> goalHistory;           // last 3 completed/failed goals
+
     // Minecraft day/night boundaries (ticks)
     private static final long SUNRISE_TICK  = 0;
     private static final long NOON_TICK     = 6000;
@@ -48,15 +56,25 @@ public class WorldState {
     private static final long MIDNIGHT_TICK = 18000;
     private static final long TICKS_PER_MIN = 1200; // 20 t/s × 60 s
 
+    // -------------------------------------------------------------------------
+    // Constructor (v1.2)
+    // -------------------------------------------------------------------------
+
     public WorldState(Location loc, int scanRadius, String npcName, UUID selfUuid,
-                      List<String> recentChatLog) {
+                      List<String> recentChatLog,
+                      Goal currentGoal, long goalElapsedSec, List<String> goalHistory) {
         World w = loc.getWorld();
-        this.x    = loc.getX();
-        this.y    = loc.getY();
-        this.z    = loc.getZ();
+        this.x           = loc.getX();
+        this.y           = loc.getY();
+        this.z           = loc.getZ();
         this.world       = w.getName();
         this.npcName     = npcName;
         this.recentChatLog = new ArrayList<>(recentChatLog);
+
+        // --- Goal context ---
+        this.currentGoalStr     = currentGoal != null ? currentGoal.toString() : "IDLE[ACTIVE]";
+        this.goalElapsedSeconds = goalElapsedSec;
+        this.goalHistory        = goalHistory != null ? new ArrayList<>(goalHistory) : new ArrayList<>();
 
         // --- Time ---
         rawTick          = w.getTime();
@@ -78,7 +96,7 @@ public class WorldState {
 
         // --- Nearby entities (self excluded) ---
         for (Entity entity : w.getNearbyEntities(loc, scanRadius, scanRadius, scanRadius)) {
-            if (entity.getUniqueId().equals(selfUuid)) continue; // skip self
+            if (entity.getUniqueId().equals(selfUuid)) continue;
             double dist = Math.round(entity.getLocation().distance(loc) * 10.0) / 10.0;
             if (entity instanceof Player p) {
                 nearbyPlayers.add(p.getName() + " (" + dist + " blocks away)");
@@ -141,6 +159,14 @@ public class WorldState {
         // Blocks
         if (!nearbyBlocks.isEmpty()) {
             sb.append("Ground blocks: ").append(String.join(", ", nearbyBlocks)).append("\n");
+        }
+
+        // Goal context
+        sb.append("\n[CURRENT GOAL]\n");
+        sb.append("  Status: ").append(currentGoalStr).append("\n");
+        sb.append("  Running for: ").append(goalElapsedSeconds).append(" seconds\n");
+        if (!goalHistory.isEmpty()) {
+            sb.append("  Recent history: ").append(String.join(" | ", goalHistory)).append("\n");
         }
 
         return sb.toString();

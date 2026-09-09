@@ -2,11 +2,9 @@
 npc:
   name: "SuperSteve"
   skin: "Steve"
-  scan-radius: 10        # blocks to scan around NPC
-  game-tick-ms: 200      # movement update interval in ms
-  ai-tick-seconds: 10    # how often to query Ollama
+  scan-radius: 10        # blocks to scan around NPC for players, mobs, chat
 
 ollama:
-  host: "http://192.168.1.102:11434"   # update to your Ollama LXC IP
-  model: "llama3.1"
+  host: "http://YOUR_OLLAMA_IP:11434"   # update to your Ollama LXC IP
+  model: "qwen2.5:3b"                   # any model; qwen2.5:3b or llama3:latest work well
   timeout-seconds: 30

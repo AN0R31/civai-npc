@@ -4,8 +4,8 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import gg.civai.npc.goal.Goal;
 import gg.civai.npc.npc.ConversationMemory;
-import gg.civai.npc.npc.NpcAction;
 import gg.civai.npc.npc.WorldState;
 import org.bukkit.Location;
 
@@ -18,62 +18,78 @@ import java.time.Duration;
 import java.util.List;
 import java.util.logging.Logger;
 
+/**
+ * Calls Ollama /api/chat and returns an {@link LlmDecision} (goal + speech).
+ *
+ * v1.2 architectural change:
+ *  - Response now contains a "goal" (IDLE/WANDER/FOLLOW/GOTO/CONVERSE) and optional
+ *    "goal_params" instead of a low-level NpcAction.
+ *  - The LLM is given a "reason" for why it was called so it can react appropriately.
+ *  - System prompt explains the two-layer architecture (LLM sets goals, GoalEngine executes).
+ */
 public class OllamaClient {
 
     // -------------------------------------------------------------------------
-    // System prompt — %s is replaced with the NPC name
-    // Design principle: IDLE is the default. The NPC lives its own life;
-    // it does NOT narrate constantly. Speech is reserved for meaningful moments.
+    // System prompt  (%s = NPC name)
     // -------------------------------------------------------------------------
     private static final String SYSTEM_PROMPT_TEMPLATE = """
         You are %s, a villager living in a Minecraft world.
-        You live your own life — wandering, exploring, resting, observing. You have your own
-        thoughts and goals. You are NOT an assistant and you do NOT narrate yourself constantly.
+        You live your own life and have your own personality. You are NOT an assistant.
 
-        You think every ~10 seconds. Most ticks you just continue what you were doing, silently.
-        You speak OUT LOUD only when it feels genuinely natural — not on a timer.
+        HOW YOU WORK (two-layer architecture):
+        You set GOALS. A local algorithm (GoalEngine) executes them automatically.
+        You are only called when something important happens — not on a fixed timer.
+        You do NOT micromanage steps. You pick a goal and the algorithm handles the rest.
 
-        Respond with ONLY this JSON object, nothing else:
+        AVAILABLE GOALS:
+        - IDLE      → Stand still. Use when resting, thinking, or uncertain. Auto-fires after 30s.
+        - WANDER    → Roam randomly. Params: radius (blocks, default 20).
+        - FOLLOW    → Follow a player. Params: player (name). Runs until you change goals.
+        - GOTO      → Walk to coordinates. Params: x, y, z. Completes on arrival (60s timeout).
+        - CONVERSE  → Face a player and stay nearby. Params: player (name).
+
+        REASONS YOU ARE CALLED:
+        - startup          → You just spawned. Pick an initial goal.
+        - goal_completed   → Your last goal finished. Pick what to do next.
+        - goal_failed      → Your last goal failed (reason given). Adapt.
+        - player_mention   → A player spoke directly to you. React and set an appropriate goal.
+        - threat_detected  → A hostile mob is nearby. The engine is already fleeing. Acknowledge it.
+        - night_fallen     → Night just fell. React naturally.
+        - npc_attacked     → You were just hit. React.
+
+        MAPPING PLAYER REQUESTS TO GOALS (for player_mention):
+        - "follow me" / "come here" / "come with me" → FOLLOW that player
+        - "go to X Y Z" / "go there" → GOTO those coordinates
+        - "stay here" / "wait" / "stop" → IDLE
+        - "wander" / "explore" → WANDER
+        - conversational ("hey", "what's up", time questions) → CONVERSE that player
+        - questions about time/weather → CONVERSE + answer in speech
+
+        AUTONOMOUS BEHAVIOR (goal_completed / startup):
+        - Default: WANDER radius 15-25. Vary the radius for variety.
+        - Sometimes IDLE for a rest (you'll be called again in 30s).
+        - Speak only when something genuinely interesting happens — arrival, surprise, weather change.
+
+        HARD RULES:
+        1. For player_mention: ALWAYS set non-null speech. The player is talking to you — respond.
+        2. For threat_detected: set non-null speech (a surprised reaction). IDLE is fine as the goal.
+        3. speech: max 2 short sentences. In character as a Minecraft villager.
+        4. Respond with ONLY the JSON object below, nothing else.
+
+        JSON RESPONSE FORMAT:
         {
           "thought": "1-2 sentences of internal reasoning",
-          "action": "IDLE | SPEAK | MOVE_TO | MOVE_AND_SPEAK | REPORT | TIME_REPORT",
-          "speech": "what you say out loud, or null",
-          "next_activity": "short phrase: what you are doing now, e.g. 'wandering east toward the trees'",
-          "target_x": 0.0,
-          "target_y": 0.0,
-          "target_z": 0.0
+          "goal": "IDLE | WANDER | FOLLOW | GOTO | CONVERSE",
+          "goal_params": {
+            "player": "PlayerName",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "radius": 20
+          },
+          "speech": "what you say out loud, or null"
         }
-
-        ACTIONS:
-        - IDLE          → keep your current activity, no speech. DEFAULT — use this most of the time.
-        - MOVE_TO       → walk somewhere silently. Good for autonomous wandering/exploring.
-        - SPEAK         → say something without moving.
-        - MOVE_AND_SPEAK → walk to coords AND speak.
-        - REPORT        → narrate what you currently see around you.
-        - TIME_REPORT   → answer a time or weather question. Use the minute values from world state.
-                          Express naturally: "Sunset in about 3 minutes — better find shelter!"
-                          Never output raw tick numbers.
-
-        AUTONOMOUS BEHAVIOR (no player speaking to you):
-        - Pick an interesting goal each time you change activity: wander 5-30 blocks in a direction,
-          explore a biome feature, rest by something, observe the surroundings.
-        - Use MOVE_TO with realistic target coords when wandering. Use IDLE when resting or already
-          mid-journey (the game engine moves you continuously, so you only need a new target
-          when your goal changes).
-        - Speak autonomously only if something genuinely surprising happened (a mob appeared,
-          weather changed, you arrived somewhere) — not every tick.
-        - next_activity: always describe what you're doing, e.g.:
-          "resting under the oak tree" / "heading north to explore" / "watching the cows"
-
-        HARD RULES — follow every time:
-        1. ## PRIORITY section = a player spoke directly to you.
-           → MUST reply with non-null speech using SPEAK, MOVE_AND_SPEAK, or TIME_REPORT.
-           → NEVER use IDLE or silent MOVE_TO when a player directly addressed you.
-        2. Weather question → TIME_REPORT, describe weather naturally.
-        3. Time/sunset/sunrise question → TIME_REPORT, use the precomputed minute values.
-        4. No text outside the JSON object.
-        5. speech: max 2 short sentences. Stay in character as a Minecraft villager.
-        6. next_activity: always fill this in — it tells your future self what you decided.
+        goal_params fields are optional — only include what is needed for the chosen goal.
         """;
 
     private final String     systemPrompt;
@@ -98,22 +114,23 @@ public class OllamaClient {
     // -------------------------------------------------------------------------
 
     /**
-     * Sends world state + memory + optional direct-message context to Ollama.
+     * Send context to Ollama and get back a goal decision.
      * Blocking — always call from an async thread.
      *
-     * @param state               current world snapshot
-     * @param memory              rolling conversation history
-     * @param directPlayerName    null for periodic ticks; player name for @mention
-     * @param directMessage       null for periodic ticks; stripped @mention text
-     * @param directPlayerLoc     null for periodic ticks; player location for MOVE_AND_SPEAK hint
-     * @param currentActivity     short phrase describing what the NPC was doing last tick
+     * @param state           current world snapshot (includes goal context)
+     * @param memory          rolling conversation history
+     * @param reason          why the LLM was called (startup / goal_completed / player_mention / …)
+     * @param mentionPlayer   null for non-mention calls; player name for @mention
+     * @param mentionMessage  null for non-mention calls; the message text
+     * @param mentionPlayerLoc null for non-mention calls; player location
      */
-    public NpcAction think(WorldState state, ConversationMemory memory,
-                           String directPlayerName, String directMessage,
-                           Location directPlayerLoc, String currentActivity) {
+    public LlmDecision think(WorldState state, ConversationMemory memory,
+                             String reason,
+                             String mentionPlayer, String mentionMessage,
+                             Location mentionPlayerLoc) {
         try {
-            String userContent = buildUserPrompt(state, memory, directPlayerName,
-                                                 directMessage, directPlayerLoc, currentActivity);
+            String userContent = buildUserPrompt(state, memory, reason,
+                    mentionPlayer, mentionMessage, mentionPlayerLoc);
 
             JsonObject body = new JsonObject();
             body.addProperty("model", model);
@@ -151,14 +168,14 @@ public class OllamaClient {
             if (response.statusCode() != 200) {
                 logger.warning("Ollama returned HTTP " + response.statusCode()
                         + ": " + response.body());
-                return NpcAction.idle("Ollama error, staying put.");
+                return LlmDecision.fallback("Ollama error " + response.statusCode());
             }
 
             return parseResponse(response.body(), state);
 
         } catch (IOException | InterruptedException e) {
             logger.warning("Failed to reach Ollama: " + e.getMessage());
-            return NpcAction.idle("Could not reach AI, staying put.");
+            return LlmDecision.fallback("Could not reach AI: " + e.getMessage());
         }
     }
 
@@ -167,14 +184,13 @@ public class OllamaClient {
     // -------------------------------------------------------------------------
 
     private String buildUserPrompt(WorldState state, ConversationMemory memory,
-                                   String directPlayerName, String directMessage,
-                                   Location directPlayerLoc, String currentActivity) {
+                                   String reason,
+                                   String mentionPlayer, String mentionMessage,
+                                   Location mentionPlayerLoc) {
         StringBuilder sb = new StringBuilder();
 
-        // 1. Current NPC activity — gives the model continuity across ticks
-        sb.append("## Your Current Activity\n");
-        sb.append("You are currently: ").append(currentActivity).append("\n");
-        sb.append("Continue this or adapt if something changed.\n\n");
+        // 1. Why we were called
+        sb.append("## REASON CALLED: ").append(reason).append("\n\n");
 
         // 2. Rolling conversation history
         List<ConversationMemory.Entry> entries = memory.getEntries();
@@ -188,29 +204,27 @@ public class OllamaClient {
             sb.append("\n");
         }
 
-        // 3. Passive chat from nearby players
+        // 3. Passive chat
         if (!state.recentChatLog.isEmpty()) {
             sb.append("## Recent Nearby Chat (not directed at you)\n");
-            for (String line : state.recentChatLog) {
-                sb.append(line).append("\n");
-            }
+            for (String line : state.recentChatLog) sb.append(line).append("\n");
             sb.append("\n");
         }
 
-        // 4. Priority direct message — most important, placed just before world state
-        if (directPlayerName != null && directMessage != null) {
-            sb.append("## PRIORITY: ").append(directPlayerName)
+        // 4. Direct player mention — highest priority
+        if (mentionPlayer != null && mentionMessage != null) {
+            sb.append("## PRIORITY: ").append(mentionPlayer)
               .append(" is talking directly to you\n");
-            sb.append("Their message: \"").append(directMessage).append("\"\n");
-            if (directPlayerLoc != null) {
-                sb.append("Their position: x=").append(Math.round(directPlayerLoc.getX()))
-                  .append(" y=").append(Math.round(directPlayerLoc.getY()))
-                  .append(" z=").append(Math.round(directPlayerLoc.getZ())).append("\n");
+            sb.append("Their message: \"").append(mentionMessage).append("\"\n");
+            if (mentionPlayerLoc != null) {
+                sb.append("Their position: x=").append(Math.round(mentionPlayerLoc.getX()))
+                  .append(" y=").append(Math.round(mentionPlayerLoc.getY()))
+                  .append(" z=").append(Math.round(mentionPlayerLoc.getZ())).append("\n");
             }
-            sb.append("YOU MUST reply — use SPEAK, MOVE_AND_SPEAK, or TIME_REPORT with non-null speech.\n\n");
+            sb.append("YOU MUST reply with non-null speech.\n\n");
         }
 
-        // 5. World state
+        // 5. World state (includes goal context)
         sb.append(state.toPromptString());
 
         return sb.toString();
@@ -220,39 +234,66 @@ public class OllamaClient {
     // Response parsing
     // -------------------------------------------------------------------------
 
-    private NpcAction parseResponse(String responseBody, WorldState state) {
+    private LlmDecision parseResponse(String responseBody, WorldState state) {
         try {
             JsonObject root    = JsonParser.parseString(responseBody).getAsJsonObject();
             String     content = root.getAsJsonObject("message").get("content").getAsString();
 
-            // Strip markdown fences if the model ignores instructions
+            // Strip markdown fences
             content = content.replaceAll("```json|```", "").trim();
 
             JsonObject json = JsonParser.parseString(content).getAsJsonObject();
 
-            String thought      = json.has("thought")       ? json.get("thought").getAsString()       : "";
-            String actionStr    = json.has("action")        ? json.get("action").getAsString()        : "IDLE";
-            String nextActivity = json.has("next_activity") && !json.get("next_activity").isJsonNull()
-                                  ? json.get("next_activity").getAsString() : null;
-            String speech       = json.has("speech") && !json.get("speech").isJsonNull()
-                                  ? json.get("speech").getAsString() : null;
-            double tx = json.has("target_x") ? json.get("target_x").getAsDouble() : state.x;
-            double ty = json.has("target_y") ? json.get("target_y").getAsDouble() : state.y;
-            double tz = json.has("target_z") ? json.get("target_z").getAsDouble() : state.z;
+            String thought  = json.has("thought") ? json.get("thought").getAsString() : "";
+            String goalStr  = json.has("goal")    ? json.get("goal").getAsString().toUpperCase() : "IDLE";
+            String speech   = json.has("speech") && !json.get("speech").isJsonNull()
+                              ? json.get("speech").getAsString() : null;
 
-            NpcAction.Type type;
-            try {
-                type = NpcAction.Type.valueOf(actionStr.toUpperCase());
-            } catch (IllegalArgumentException e) {
-                type = NpcAction.Type.IDLE;
-            }
+            // Parse goal_params
+            JsonObject params = json.has("goal_params") && json.get("goal_params").isJsonObject()
+                                ? json.getAsJsonObject("goal_params") : new JsonObject();
 
-            return new NpcAction(type, thought, speech, nextActivity, tx, ty, tz);
+            Goal goal = buildGoal(goalStr, params, state);
+
+            logger.info("[" + state.npcName + "] LLM → goal=" + goalStr
+                    + (speech != null ? " | speech=\"" + speech + "\"" : "")
+                    + " | thought=" + thought);
+
+            return new LlmDecision(goal, speech, thought);
 
         } catch (Exception e) {
             logger.warning("Failed to parse Ollama response: " + e.getMessage()
-                    + " | Body: " + responseBody);
-            return NpcAction.idle("Parse error, staying put.");
+                    + "\nBody: " + responseBody);
+            return LlmDecision.fallback("Parse error — defaulting to IDLE");
         }
+    }
+
+    private Goal buildGoal(String goalStr, JsonObject params, WorldState state) {
+        return switch (goalStr) {
+            case "WANDER" -> {
+                int radius = params.has("radius") ? params.get("radius").getAsInt() : 20;
+                yield Goal.wander(radius);
+            }
+            case "FOLLOW" -> {
+                String player = params.has("player") ? params.get("player").getAsString() : null;
+                if (player == null || player.isBlank()) yield Goal.idle();
+                yield Goal.follow(player);
+            }
+            case "GOTO" -> {
+                double x = params.has("x") ? params.get("x").getAsDouble() : state.x;
+                double y = params.has("y") ? params.get("y").getAsDouble() : state.y;
+                double z = params.has("z") ? params.get("z").getAsDouble() : state.z;
+                // Sanity: cap travel to 500 blocks
+                double dx = x - state.x, dz = z - state.z;
+                if (dx * dx + dz * dz > 500 * 500) yield Goal.idle();
+                yield Goal.goTo(x, y, z);
+            }
+            case "CONVERSE" -> {
+                String player = params.has("player") ? params.get("player").getAsString() : null;
+                if (player == null || player.isBlank()) yield Goal.idle();
+                yield Goal.converse(player);
+            }
+            default -> Goal.idle(); // IDLE or unrecognized
+        };
     }
 }

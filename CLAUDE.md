@@ -31,8 +31,8 @@ A **Paper Minecraft plugin** (Java) that spawns AI-powered NPCs driven by a **lo
 - **Maven**: 3.9.9 at `/usr/share/maven`
 - **JAVA_HOME must be set**: `export JAVA_HOME=/usr/lib/jvm/temurin-21-jdk-amd64`
 - **Build command**: `cd /opt/civai-npc && mvn package`
-- **Output jar**: `target/ai-npc-1.1.2.jar`
-- **Deploy**: `cp target/ai-npc-1.1.2.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
+- **Output jar**: `target/ai-npc-1.2.0.jar`
+- **Deploy**: `cp target/ai-npc-1.2.0.jar /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/`
 
 ---
 
@@ -53,16 +53,20 @@ A **Paper Minecraft plugin** (Java) that spawns AI-powered NPCs driven by a **lo
 gg.civai.npc
 ├── AiNpcPlugin.java              # JavaPlugin entry point, wires everything together
 ├── ai/
-│   └── OllamaClient.java         # HTTP POST to Ollama /api/chat, parses JSON response into NpcAction
+│   ├── LlmDecision.java          # Record: goal + speech + thought returned by OllamaClient (v1.2)
+│   └── OllamaClient.java         # HTTP POST to Ollama /api/chat, parses JSON response into LlmDecision
 ├── command/
 │   └── NpcCommand.java           # /ainpc spawn|remove|status
+├── goal/                         # NEW in v1.2
+│   ├── Goal.java                 # Goal data class: type (IDLE/WANDER/FOLLOW/GOTO/CONVERSE), status, params
+│   └── GoalEngine.java           # Fast-tick (200ms) deterministic executor; fires callbacks to AiNpc
 └── npc/
-    ├── AiNpc.java                # Core NPC: spawns Villager entity, game tick + AI tick + memory
+    ├── AiNpc.java                # Core NPC: spawns Villager, delegates movement to GoalEngine, calls LLM on events
     ├── ConversationMemory.java   # Circular buffer of last 10 player↔NPC exchanges (v1.1)
-    ├── NpcAction.java            # Enum + data class (IDLE/SPEAK/MOVE_TO/MOVE_AND_SPEAK/REPORT/TIME_REPORT)
-    ├── NpcManager.java           # Manages NPC list, routes @mention vs passive chat
+    ├── NpcAction.java            # Kept for backwards compat — effectively replaced by Goal in v1.2
+    ├── NpcManager.java           # Manages NPC list; routes @mention, passive chat; night/attack event listeners
     ├── NpcPersistenceManager.java# Save/load NPC locations to npcs.yml (v1.1)
-    └── WorldState.java           # Surroundings snapshot + time/weather details for Ollama prompt
+    └── WorldState.java           # Surroundings snapshot + time/weather + goal context for Ollama prompt
 ```
 
 ---
@@ -71,18 +75,20 @@ gg.civai.npc
 
 1. Player runs `/ainpc spawn`
 2. `NpcManager.spawnAt()` creates an `AiNpc`, which spawns a Villager entity with vanilla AI disabled
-3. Two schedulers start:
-    - **Game tick** (every 4 ticks / 200ms): moves NPC toward `targetLocation` via linear interpolation
-    - **AI tick** (every 10 seconds): collects `WorldState`, calls `OllamaClient.think()` async, applies returned `NpcAction` on main thread
-4. Player right-clicks NPC or chats nearby → stored as `lastPlayerMessage`, consumed on next AI tick
-5. `OllamaClient` sends a system prompt + world state to `POST /api/chat`, expects JSON response, strips markdown fences, parses into `NpcAction`
+3. `AiNpc` creates a `GoalEngine` and starts the **game tick** (every 4 ticks / 200ms), which calls `goalEngine.tick()`.
+4. After 2 seconds, a `"startup"` LLM call fires → Ollama returns a `Goal` (e.g. WANDER) + optional speech.
+5. `GoalEngine` executes the Goal locally: for WANDER, it picks random sub-targets and moves the NPC; for FOLLOW, it chases the player; etc.
+6. When a Goal completes or fails, GoalEngine fires a callback → `AiNpc.triggerLlmCall("goal_completed")` → another Ollama call → new Goal.
+7. Player types `@Steve <message>` → `NpcManager` routes to `AiNpc.triggerImmediateResponse()` → immediate Ollama call with reason `"player_mention"` → new Goal + speech.
+8. World events (night falls, NPC attacked, threat detected) → `triggerLlmCall()` with appropriate reason.
+9. `OllamaClient` sends system prompt + world state (with goal context) to `POST /api/chat`, parses JSON `{goal, goal_params, speech}` into `LlmDecision`.
 
 ---
 
 ## Ollama Integration
 
 - **Endpoint**: `http://192.168.1.104:11434/api/chat`
-- **Model**: `llama3:latest` (confirmed working via `curl http://192.168.1.104:11434/api/tags`)
+- **Model**: `qwen2.5:3b` (updated for v1.2; confirm with `curl http://192.168.1.104:11434/api/tags`)
 - **Stream**: `false` (blocking single response)
 - **Format**: JSON object enforced via `format` parameter + system prompt
 - **Timeout**: 60 seconds on the HTTP request (Ollama on 8B model takes 2-10s typically)
@@ -110,13 +116,13 @@ gg.civai.npc
 
 ---
 
-## Current Limitations (as of v1.1.0)
+## Current Limitations (as of v1.2.0)
 
-- **No pathfinding**: movement is linear interpolation, NPC walks through walls/water
-- **Memory is in-RAM only**: conversation history resets on server restart (persistence coming later)
+- **No pathfinding**: movement is linear interpolation; NPC steps around 1-block obstacles but has no A* or nav-mesh
+- **Memory is in-RAM only**: conversation history resets on server restart
 - **Single personality**: one system prompt for all NPCs (config-driven profiles planned)
 - **Villager entity only**: appearance is always a vanilla villager
-- **Movement cap**: 50 blocks max per decision to prevent runaway coordinates
+- **GOTO 500-block cap**: coordinates beyond 500 blocks from NPC position are rejected
 - **Single NPC**: only one NPC (npc.name) is supported; multi-NPC planned
 
 ---
@@ -192,6 +198,24 @@ Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD 
 - 50-block movement cap per decision
 - `config.yml` (runtime, gitignored) + `config.example.yml` (committed)
 
+### v1.2.0 — 2026-09-09 — Two-layer AI: GoalEngine + event-driven LLM
+
+Major architectural refactor. The AI is now split into two layers:
+
+**LLM layer (event-driven):** Ollama is called only on events — startup, goal completion/failure, player @mention, threat detected, night fallen, NPC attacked. Never on a fixed timer. Returns a Goal + optional speech.
+
+**GoalEngine layer (200ms tick):** Deterministic local executor. Runs autonomously between LLM calls. Goals: `IDLE` (30s then fires completion), `WANDER` (random sub-targets, 2-min timeout), `FOLLOW` (tracks player 3 blocks behind, fails if offline), `GOTO` (linear movement to coords, 60s timeout), `CONVERSE` (face player, stay within 4 blocks).
+
+- **`Goal.java`** (new `gg.civai.npc.goal` package): Goal type enum (IDLE/WANDER/FOLLOW/GOTO/CONVERSE), status enum (PENDING/ACTIVE/COMPLETED/FAILED/BLOCKED), factory methods, fields for params and timeout.
+- **`GoalEngine.java`** (new): Game-tick executor with terrain-following movement ported from AiNpc. Threat detection: flees from hostile mobs within 5 blocks, resumes previous goal after 3s clear. Fires `onGoalComplete`, `onGoalFailed`, `onThreatDetected` callbacks to AiNpc.
+- **`LlmDecision.java`** (new): Record replacing NpcAction as the return type of `OllamaClient.think()`.
+- **`AiNpc.java`**: Removed fixed 10s AI tick and all movement code (moved to GoalEngine). Added `triggerLlmCall(reason, context)` for event-driven calls. `triggerImmediateResponse` still handles @mentions with queue. LLM response applies Goal via `goalEngine.setGoal()`.
+- **`OllamaClient.java`**: New response format (`goal` + `goal_params` + `speech` instead of action). System prompt explains two-layer architecture, available goals, event reasons, and player-request→goal mapping.
+- **`WorldState.java`**: Adds current goal type/status, elapsed seconds, last 3 goal history to prompt.
+- **`NpcManager.java`**: Adds `EntityDamageEvent` listener (fires LLM when NPC is hit) and 30-second night-check scheduler.
+- **`NpcCommand.java`**: Status command now shows current goal type, status, and params instead of NpcAction.
+- Ollama model updated to `qwen2.5:3b` per spec.
+
 ### v1.1.2 — 2026-09-08 — Time accuracy fix, @mention queue
 - **Time hallucination fix** (`WorldState.toPromptString`): time facts now formatted as a labelled block with `[TIME - use these EXACT numbers, do not invent your own]` header and one line per event (sunset/midnight/sunrise/noon) so small models copy the values directly instead of guessing
 - **@mention queue** (`AiNpc`): when `thinkingLock` is held (periodic tick in flight), the @mention is now queued (most-recent-wins) instead of silently dropped; fires automatically when the current think completes; logged as "queued" / "firing queued" for visibility
@@ -220,7 +244,7 @@ Each entry records a session's worth of changes. Format: `vX.Y.Z — YYYY-MM-DD 
 
 ```bash
 # Build and deploy in one line
-cd /opt/civai-npc && mvn package && cp target/ai-npc-1.1.2.jar \
+cd /opt/civai-npc && mvn package && cp target/ai-npc-1.2.0.jar \
   /opt/crafty-controller/crafty/crafty-4/servers/da5eee84-3052-4a5f-9f07-9c126b40022f/plugins/
 
 # Test Ollama reachability

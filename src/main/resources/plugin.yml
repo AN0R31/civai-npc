@@ -1,5 +1,5 @@
 name: ai-npc
-version: 1.1.2
+version: 1.2.0
 main: gg.civai.npc.AiNpcPlugin
 api-version: '1.21'
 description: AI-powered NPC using local Ollama

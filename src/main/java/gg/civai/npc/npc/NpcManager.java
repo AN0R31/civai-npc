@@ -6,9 +6,12 @@ import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Location;
 import org.bukkit.World;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -16,10 +19,13 @@ import java.util.List;
 /**
  * Manages the list of active AI NPCs and routes player chat to them.
  *
- * Chat model (v1.1):
- *  - "@Steve <message>" → immediate Ollama call, memory recorded
- *  - Any other message within scan radius → passive chat log (Steve observes but doesn't react immediately)
- *  - Right-click interaction removed (was redundant with @mention)
+ * v1.2 additions:
+ *  - Night-fallen detection: scheduler polls every 30 s, fires LLM when world crosses tick 13000
+ *  - EntityDamageEvent: fires LLM with reason "npc_attacked" if an NPC is hit
+ *
+ * Chat model (unchanged from v1.1):
+ *  - "@Steve <message>" → immediate LLM call, memory recorded
+ *  - Any other message within scan radius → passive chat log
  */
 public class NpcManager implements Listener {
 
@@ -31,6 +37,10 @@ public class NpcManager implements Listener {
     private final String npcName;
     private final int    scanRadius;
 
+    // Night-fall detection
+    private boolean lastWasDay = true;
+    private BukkitTask nightCheckTask;
+
     public NpcManager(AiNpcPlugin plugin, OllamaClient ollamaClient, NpcPersistenceManager persistence) {
         this.plugin       = plugin;
         this.ollamaClient = ollamaClient;
@@ -39,6 +49,7 @@ public class NpcManager implements Listener {
         this.scanRadius   = plugin.getConfig().getInt("npc.scan-radius", 10);
 
         plugin.getServer().getPluginManager().registerEvents(this, plugin);
+        startNightCheck();
     }
 
     // -------------------------------------------------------------------------
@@ -77,6 +88,7 @@ public class NpcManager implements Listener {
 
     /** Despawn and remove all NPCs (called on plugin disable — does NOT delete persistence). */
     public void removeAll() {
+        if (nightCheckTask != null) nightCheckTask.cancel();
         npcs.forEach(AiNpc::remove);
         npcs.clear();
     }
@@ -114,32 +126,75 @@ public class NpcManager implements Listener {
     }
 
     // -------------------------------------------------------------------------
-    // Chat event — Paper AsyncChatEvent
+    // Event: Player chat (unchanged from v1.1)
     // -------------------------------------------------------------------------
 
     @EventHandler
     public void onPlayerChat(AsyncChatEvent event) {
-        Player player   = event.getPlayer();
-        String message  = PlainTextComponentSerializer.plainText().serialize(event.message());
-        Location playerLoc = player.getLocation(); // position snapshot (safe to read async)
+        Player   player    = event.getPlayer();
+        String   message   = PlainTextComponentSerializer.plainText().serialize(event.message());
+        Location playerLoc = player.getLocation();
 
-        String tag     = "@" + npcName;
+        String  tag    = "@" + npcName;
         boolean direct = message.toLowerCase().startsWith(tag.toLowerCase());
 
         if (direct) {
-            // Strip the @mention prefix and fire an immediate Ollama response
             String stripped = message.substring(tag.length()).trim();
             for (AiNpc npc : npcs) {
                 if (!npc.isValid()) continue;
                 npc.triggerImmediateResponse(player.getName(), stripped, playerLoc);
             }
         } else {
-            // Passive observation — Steve notices but doesn't react immediately
             String logEntry = "[" + player.getName() + "]: " + message;
             for (AiNpc npc : npcs) {
                 if (!npc.isValid()) continue;
                 npc.onPassiveChat(logEntry, playerLoc);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Event: NPC attacked (v1.2)
+    // -------------------------------------------------------------------------
+
+    @EventHandler
+    public void onEntityDamage(EntityDamageEvent event) {
+        Entity damaged = event.getEntity();
+        for (AiNpc npc : npcs) {
+            if (!npc.isValid()) continue;
+            if (npc.getEntity() != null && npc.getEntity().getUniqueId().equals(damaged.getUniqueId())) {
+                plugin.getLogger().info("[" + npcName + "] NPC attacked — triggering LLM");
+                npc.triggerLlmCall("npc_attacked", "");
+                break;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Night-fall detection scheduler (v1.2)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Polls every 30 seconds. When the primary NPC's world crosses from day (tick < 13000)
+     * to night (tick >= 13000), fires an LLM call with reason "night_fallen".
+     */
+    private void startNightCheck() {
+        nightCheckTask = plugin.getServer().getScheduler().runTaskTimer(plugin, () -> {
+            for (AiNpc npc : npcs) {
+                if (!npc.isValid()) continue;
+                Location loc = npc.getLocation();
+                if (loc == null) continue;
+
+                World  w      = loc.getWorld();
+                boolean isDay = w.getTime() < 13000;
+
+                if (lastWasDay && !isDay) {
+                    plugin.getLogger().info("[" + npcName + "] Night fallen — triggering LLM");
+                    npc.triggerLlmCall("night_fallen", "");
+                }
+                lastWasDay = isDay;
+                break; // only check based on first valid NPC's world
+            }
+        }, 20L * 30, 20L * 30); // every 30 seconds
     }
 }
