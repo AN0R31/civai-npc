@@ -1,6 +1,7 @@
 package gg.civai.npc.goal;
 
 import org.bukkit.Bukkit;
+import org.bukkit.HeightMap;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.block.Block;
@@ -269,6 +270,9 @@ public class GoalEngine {
             wanderTarget = pickWanderTarget(loc, currentGoal.wanderRadius > 0
                     ? currentGoal.wanderRadius : WANDER_RADIUS_DEFAULT);
             if (wanderTarget == null) return; // all candidates rejected — wait next tick
+            logger.info("[" + npcName + "] Wander sub-target → ("
+                    + (int) wanderTarget.getX() + "," + (int) wanderTarget.getY()
+                    + "," + (int) wanderTarget.getZ() + ")");
         }
 
         moveToward(loc, wanderTarget);
@@ -402,6 +406,10 @@ public class GoalEngine {
      * Pick a safe random wander sub-target within {@code radius} blocks of {@code origin}.
      * Avoids liquid surfaces and steep elevation changes.
      * Returns null if all 8 candidates fail.
+     *
+     * Uses MOTION_BLOCKING_NO_LEAVES heightmap so decorations (short grass, flowers, snow
+     * layers) are ignored and we land on the actual solid ground block — not the decoration
+     * sitting on top of it, which isSolid()=false and would reject every grassy candidate.
      */
     private Location pickWanderTarget(Location origin, int radius) {
         World w = origin.getWorld();
@@ -410,18 +418,18 @@ public class GoalEngine {
             double dist  = 4 + Math.random() * radius;
             int nx = (int) Math.floor(origin.getX() + Math.cos(angle) * dist);
             int nz = (int) Math.floor(origin.getZ() + Math.sin(angle) * dist);
-            int ny = w.getHighestBlockYAt(nx, nz);
+            // MOTION_BLOCKING_NO_LEAVES: highest block that stops entity motion,
+            // skipping leaves and non-solid decorations like short grass and flowers.
+            int ny = w.getHighestBlockYAt(nx, nz, HeightMap.MOTION_BLOCKING_NO_LEAVES);
 
-            if (isLiquid(w.getBlockAt(nx, ny, nz))) continue;           // no liquid surface
-            if (Math.abs(ny - origin.getBlockY()) > 5) continue;        // no steep cliff
-
-            // Basic safety: not liquid above solid
-            Block ground = w.getBlockAt(nx, ny, nz);
-            if (!ground.getType().isSolid()) continue;
+            if (isLiquid(w.getBlockAt(nx, ny, nz))) continue;    // no standing on water/lava
+            if (Math.abs(ny - origin.getBlockY()) > 5) continue;  // no steep cliff
 
             return new Location(w, nx + 0.5, ny + 1.0, nz + 0.5);
         }
-        return null; // all candidates rejected
+        logger.fine("[" + npcName + "] pickWanderTarget: all candidates rejected near "
+                + (int)origin.getX() + "," + (int)origin.getZ());
+        return null;
     }
 
     // -------------------------------------------------------------------------
@@ -441,7 +449,8 @@ public class GoalEngine {
 
         if (foot.isPassable() && head.isPassable()) {
             if (under.isPassable()) {
-                int groundY = w.getHighestBlockYAt(bx, bz);
+                // Use MOTION_BLOCKING_NO_LEAVES so we land on solid ground, not on a flower
+                int groundY = w.getHighestBlockYAt(bx, bz, HeightMap.MOTION_BLOCKING_NO_LEAVES);
                 if (isLiquid(w.getBlockAt(bx, groundY, bz))) return Double.NaN;
                 return groundY + 1.0;
             }
