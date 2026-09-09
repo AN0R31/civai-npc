@@ -78,6 +78,8 @@ public class OllamaClient {
         4. Respond with ONLY the JSON object below, nothing else.
         5. Never repeat speech from Recent Conversation History — always say something new.
         6. For time/weather questions: copy the exact numbers from [QUICK FACTS]. Never invent values.
+        7. "carry on" / "bye" / "goodbye" / "later" / "see you" / "farewell" ALWAYS maps to WANDER.
+           The player is dismissing you. Do not stay in CONVERSE. Set goal=WANDER.
 
         JSON RESPONSE FORMAT:
         {

@@ -8,7 +8,7 @@ import org.bukkit.block.Block;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Monster;
 import org.bukkit.entity.Player;
-import org.bukkit.entity.Villager;
+import org.bukkit.entity.Mob;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -59,12 +59,13 @@ public class GoalEngine {
     private static final int WANDER_RADIUS_DEFAULT = 20;
 
     // Stuck detection (position-based)
-    private static final int  STUCK_TICKS     = 12;   // ~2.4 s of zero movement
-    private static final double STUCK_MOVE_SQ = 0.01; // must move this much per tick to reset
+    private static final int    STUCK_TICKS      = 20;   // ~4 s of zero movement
+    private static final double STUCK_MOVE_SQ    = 0.01; // must move this much per tick to reset
+    private static final long   STUCK_GRACE_MS   = 3_000L; // pause path-recalc after getting stuck
 
     // -------------------------------------------------------------------------
 
-    private final Villager          entity;
+    private final Mob                entity;
     private final Logger            logger;
     private final String            npcName;
     private final int               scanRadius;
@@ -101,7 +102,7 @@ public class GoalEngine {
     // Construction
     // -------------------------------------------------------------------------
 
-    public GoalEngine(Villager entity, Logger logger, String npcName, int scanRadius,
+    public GoalEngine(Mob entity, Logger logger, String npcName, int scanRadius,
                       Runnable onGoalComplete,
                       Consumer<String> onGoalFailed,
                       Runnable onThreatDetected) {
@@ -392,7 +393,7 @@ public class GoalEngine {
 
         double dist = npcLoc.distance(playerLoc);
         if (dist > CONVERSE_MAX_DIST) {
-            // Path toward player
+            // Approach player via A* path (recalc every 2 s)
             long now = System.currentTimeMillis();
             if (isPathDone() || now - lastFollowRecalcMs >= FOLLOW_RECALC_MS) {
                 startPath(npcLoc, playerLoc);
@@ -403,9 +404,10 @@ public class GoalEngine {
             } else {
                 moveToward(npcLoc, playerLoc);
             }
-            updateStuckDetection(true);
+            // No updateStuckDetection here — if the player is unreachable the NPC simply
+            // faces them from wherever it stands. Removing it breaks the clear→recalc→stuck loop.
         } else {
-            // Close enough — stand still facing player; reset stuck state
+            // Close enough — face the player and stand still
             samePosTicks   = 0;
             lastCheckedPos = null;
         }
@@ -432,18 +434,29 @@ public class GoalEngine {
     }
 
     /**
-     * Advance along the current path toward the next waypoint.
-     * Skips waypoints that are already within 0.6 blocks (XZ).
+     * Advance along the current A* path toward the next waypoint.
+     *
+     * Crucially, Y is interpolated directly from the A*-validated waypoint rather than
+     * going through {@link #resolveY}.  This avoids the step-down mismatch where
+     * A* plans Y=65 but resolveY (starting from the entity's current Y=66) tries a
+     * step-up and returns NaN — causing every single step on a slope to fail.
      */
     private void followPath(Location loc) {
         if (isPathDone()) return;
 
-        // Advance past already-reached waypoints
+        // Advance past already-reached waypoints (0.5-block XZ radius)
         while (pathIdx < currentPath.size()) {
             Location wp = currentPath.get(pathIdx);
             double   dx = wp.getX() - loc.getX();
             double   dz = wp.getZ() - loc.getZ();
-            if (dx * dx + dz * dz < 0.36) { // 0.6-block radius
+            if (dx * dx + dz * dz < 0.25) {
+                // Snap Y to the A*-validated waypoint height before moving on
+                if (Math.abs(wp.getY() - loc.getY()) > 0.05) {
+                    entity.teleport(new Location(loc.getWorld(),
+                            loc.getX(), wp.getY(), loc.getZ(),
+                            entity.getLocation().getYaw(), 0f));
+                    loc = entity.getLocation();
+                }
                 pathIdx++;
             } else {
                 break;
@@ -451,7 +464,29 @@ public class GoalEngine {
         }
         if (pathIdx >= currentPath.size()) { currentPath = null; return; }
 
-        moveToward(loc, currentPath.get(pathIdx));
+        Location wp   = currentPath.get(pathIdx);
+        double   dx   = wp.getX() - loc.getX();
+        double   dz   = wp.getZ() - loc.getZ();
+        double   dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < 0.01) return;
+
+        double step = Math.min(MOVE_SPEED, dist);
+        double nx   = loc.getX() + dx / dist * step;
+        double nz   = loc.getZ() + dz / dist * step;
+
+        // Y: interpolate toward the waypoint's A*-approved height (max 0.5 blocks/tick).
+        // This replaces resolveY for path-following — the path already guarantees walkability.
+        double targetY = wp.getY();
+        double ny;
+        double yDiff = targetY - loc.getY();
+        if (Math.abs(yDiff) > 0.5) {
+            ny = loc.getY() + Math.signum(yDiff) * 0.5;
+        } else {
+            ny = targetY;
+        }
+
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        entity.teleport(new Location(loc.getWorld(), nx, ny, nz, yaw, 0f));
     }
 
     /**
@@ -472,10 +507,12 @@ public class GoalEngine {
             if (movedSq < STUCK_MOVE_SQ) {
                 samePosTicks++;
                 if (samePosTicks >= STUCK_TICKS) {
-                    samePosTicks   = 0;
-                    currentPath    = null;
-                    wanderTarget   = null;
-                    lastCheckedPos = null;
+                    samePosTicks       = 0;
+                    currentPath        = null;
+                    wanderTarget       = null;
+                    lastCheckedPos     = null;
+                    // Grace period: don't immediately recalculate another bad path
+                    lastFollowRecalcMs = System.currentTimeMillis() + STUCK_GRACE_MS;
                     logger.info("[" + npcName + "] Stuck — clearing path + sub-target");
                 }
             } else {

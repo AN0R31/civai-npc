@@ -7,13 +7,31 @@ import gg.civai.npc.goal.Goal;
 import gg.civai.npc.goal.GoalEngine;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
+import org.bukkit.Bukkit;
 import org.bukkit.Location;
-import org.bukkit.entity.Villager;
+import org.bukkit.Material;
+import org.bukkit.entity.Husk;
+import org.bukkit.entity.Mob;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.SkullMeta;
+import org.bukkit.profile.PlayerProfile;
+import org.bukkit.profile.PlayerTextures;
 import org.bukkit.scheduler.BukkitTask;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
+import java.net.URI;
+import java.net.URL;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
+import java.util.UUID;
 import java.util.logging.Logger;
 
 /**
@@ -40,7 +58,7 @@ public class AiNpc {
     private final int          scanRadius;
 
     // Entity
-    private Villager entity;
+    private Mob entity;
 
     // Goal engine (created on spawn, handles movement and goal execution)
     private GoalEngine goalEngine;
@@ -79,14 +97,29 @@ public class AiNpc {
     // -------------------------------------------------------------------------
 
     public void spawn(Location location) {
-        entity = location.getWorld().spawn(location, Villager.class, v -> {
-            v.customName(Component.text(name, NamedTextColor.YELLOW));
-            v.setCustomNameVisible(true);
-            v.setAI(false);               // GoalEngine handles all movement
-            v.setInvulnerable(true);
-            v.setSilent(true);            // we handle speech
-            v.setRemoveWhenFarAway(false);
+        // Husk: humanoid model, shows armor, does NOT burn in sunlight, setAI(false) safe
+        entity = location.getWorld().spawn(location, Husk.class, h -> {
+            h.customName(Component.text(name, NamedTextColor.YELLOW));
+            h.setCustomNameVisible(true);
+            h.setAI(false);               // GoalEngine handles all movement
+            h.setInvulnerable(true);
+            h.setSilent(true);            // we handle speech
+            h.setRemoveWhenFarAway(false);
+            h.setConversionTime(-1);      // never convert to Zombie in water
+            // Diamond armour — drop chance 0 so nothing falls on (hypothetical) death
+            h.getEquipment().setChestplate(new ItemStack(Material.DIAMOND_CHESTPLATE));
+            h.getEquipment().setChestplateDropChance(0f);
+            h.getEquipment().setLeggings(new ItemStack(Material.DIAMOND_LEGGINGS));
+            h.getEquipment().setLeggingsDropChance(0f);
+            h.getEquipment().setBoots(new ItemStack(Material.DIAMOND_BOOTS));
+            h.getEquipment().setBootsDropChance(0f);
         });
+
+        // Fetch skin async and apply as player-skull helmet (non-blocking)
+        String skinName = plugin.getConfig().getString("npc.skin", "");
+        if (skinName != null && !skinName.isBlank()) {
+            applySkin(skinName);
+        }
 
         // Build GoalEngine with callbacks that re-invoke the LLM
         goalEngine = new GoalEngine(
@@ -277,9 +310,121 @@ public class AiNpc {
     public Location getLocation()        { return entity != null ? entity.getLocation() : null; }
     public String   getName()            { return name; }
     public int      getScanRadius()      { return scanRadius; }
-    public Villager getEntity()          { return entity; }
+    public Mob      getEntity()          { return entity; }
     public Goal     getCurrentGoal()     { return goalEngine != null ? goalEngine.getCurrentGoal() : null; }
     public ConversationMemory getMemory(){ return memory; }
+
+    // -------------------------------------------------------------------------
+    // Skin fetching (async Mojang API)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Fetch the skin texture for {@code skinName} from Mojang and apply it as
+     * a player-skull helmet on the entity.  Runs fully async; applies on main thread.
+     *
+     * Flow: Mojang UUID lookup → session-server profile → decode base64 texture
+     * → build PlayerProfile with texture URL → set as skull helmet.
+     */
+    private void applySkin(String skinName) {
+        plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
+            try {
+                HttpClient http = HttpClient.newBuilder()
+                        .connectTimeout(Duration.ofSeconds(5))
+                        .build();
+
+                // 1. UUID lookup
+                HttpResponse<String> uuidResp = http.send(
+                        HttpRequest.newBuilder()
+                                .uri(URI.create("https://api.mojang.com/users/profiles/minecraft/"
+                                        + skinName))
+                                .timeout(Duration.ofSeconds(5)).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+
+                if (uuidResp.statusCode() != 200) {
+                    logger.warning("[" + name + "] Skin: UUID lookup failed (HTTP "
+                            + uuidResp.statusCode() + ") for '" + skinName + "'");
+                    return;
+                }
+
+                JsonObject uuidJson = JsonParser.parseString(uuidResp.body()).getAsJsonObject();
+                String rawId = uuidJson.get("id").getAsString();
+                UUID uuid = UUID.fromString(rawId.replaceFirst(
+                        "(\\w{8})(\\w{4})(\\w{4})(\\w{4})(\\w{12})", "$1-$2-$3-$4-$5"));
+
+                // 2. Profile with skin
+                HttpResponse<String> profileResp = http.send(
+                        HttpRequest.newBuilder()
+                                .uri(URI.create(
+                                        "https://sessionserver.mojang.com/session/minecraft/profile/"
+                                        + rawId + "?unsigned=false"))
+                                .timeout(Duration.ofSeconds(5)).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+
+                if (profileResp.statusCode() != 200) {
+                    logger.warning("[" + name + "] Skin: profile fetch failed (HTTP "
+                            + profileResp.statusCode() + ")");
+                    return;
+                }
+
+                JsonObject profileJson = JsonParser.parseString(profileResp.body()).getAsJsonObject();
+                JsonArray  properties  = profileJson.getAsJsonArray("properties");
+
+                String textureValue = null;
+                for (int i = 0; i < properties.size(); i++) {
+                    JsonObject prop = properties.get(i).getAsJsonObject();
+                    if ("textures".equals(prop.get("name").getAsString())) {
+                        textureValue = prop.get("value").getAsString();
+                        break;
+                    }
+                }
+                if (textureValue == null) {
+                    logger.warning("[" + name + "] Skin: no texture property for '" + skinName + "'");
+                    return;
+                }
+
+                // 3. Decode base64 → get skin URL + model
+                String      decoded   = new String(Base64.getDecoder().decode(textureValue));
+                JsonObject  texJson   = JsonParser.parseString(decoded).getAsJsonObject();
+                JsonObject  skinObj   = texJson.getAsJsonObject("textures").getAsJsonObject("SKIN");
+                String      skinUrl   = skinObj.get("url").getAsString();
+                boolean     isSlim    = skinObj.has("metadata")
+                        && "slim".equals(skinObj.getAsJsonObject("metadata")
+                                              .get("model").getAsString());
+
+                final UUID   fUuid   = uuid;
+                final String fUrl    = skinUrl;
+                final boolean fSlim  = isSlim;
+
+                // 4. Apply on main thread
+                plugin.getServer().getScheduler().runTask(plugin, () -> {
+                    if (entity == null || !entity.isValid()) return;
+                    try {
+                        PlayerProfile profile = Bukkit.createPlayerProfile(fUuid, skinName);
+                        PlayerTextures textures = profile.getTextures();
+                        textures.setSkin(new URL(fUrl),
+                                fSlim ? PlayerTextures.SkinModel.SLIM
+                                       : PlayerTextures.SkinModel.CLASSIC);
+                        profile.setTextures(textures);
+
+                        ItemStack skull = new ItemStack(Material.PLAYER_HEAD);
+                        SkullMeta meta  = (SkullMeta) skull.getItemMeta();
+                        meta.setOwnerProfile(profile);
+                        skull.setItemMeta(meta);
+
+                        entity.getEquipment().setHelmet(skull);
+                        entity.getEquipment().setHelmetDropChance(0f);
+                        logger.info("[" + name + "] Skin applied: " + skinName
+                                + " (" + (fSlim ? "slim" : "classic") + ")");
+                    } catch (Exception e) {
+                        logger.warning("[" + name + "] Skin apply error: " + e.getMessage());
+                    }
+                });
+
+            } catch (Exception e) {
+                logger.warning("[" + name + "] Skin fetch error: " + e.getMessage());
+            }
+        });
+    }
 
     private String formatLoc(Location l) {
         return String.format("(%.1f, %.1f, %.1f) in %s",
