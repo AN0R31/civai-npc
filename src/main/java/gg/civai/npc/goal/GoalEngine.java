@@ -74,6 +74,10 @@ public class GoalEngine {
     // WANDER sub-state
     private Location wanderTarget = null;
 
+    // Stuck detection — counts consecutive ticks where moveStep could not move
+    private int  stuckTicks      = 0;
+    private static final int STUCK_THRESHOLD = 5; // ~1 second of blocked movement
+
     // IDLE sub-state
     private long idleStartMs = 0;
 
@@ -134,6 +138,7 @@ public class GoalEngine {
         goal.status  = Goal.Status.ACTIVE;
         currentGoal  = goal;
         wanderTarget = null;
+        stuckTicks   = 0;
         idleStartMs  = 0;
         // Don't clear threat mode here — threat takes priority
         logger.info("[" + npcName + "] Goal set: " + goal);
@@ -367,6 +372,8 @@ public class GoalEngine {
 
     /**
      * Execute a single horizontal step, resolving Y via terrain logic.
+     * Tracks consecutive blocked ticks; after STUCK_THRESHOLD failures in a row,
+     * clears the current wander sub-target so a new one is picked next tick.
      */
     private void moveStep(Location current, double nx, double nz) {
         World w      = current.getWorld();
@@ -375,8 +382,18 @@ public class GoalEngine {
         int   byFeet = (int) Math.floor(current.getY());
 
         double ny = resolveY(w, bx, bz, byFeet, current.getY());
-        if (Double.isNaN(ny)) return;                   // blocked — stay put
-        if (Math.abs(ny - current.getY()) > 3.0) return; // cliff guard
+        if (Double.isNaN(ny) || Math.abs(ny - current.getY()) > 3.0) {
+            // Blocked (liquid, wall, cliff) — count stuck ticks
+            stuckTicks++;
+            if (stuckTicks >= STUCK_THRESHOLD) {
+                logger.info("[" + npcName + "] Stuck for " + stuckTicks + " ticks — picking new sub-target");
+                stuckTicks    = 0;
+                wanderTarget  = null; // force executeWander to pick a fresh direction next tick
+            }
+            return;
+        }
+
+        stuckTicks = 0; // moved successfully — reset counter
 
         double dx = nx - current.getX();
         double dz = nz - current.getZ();

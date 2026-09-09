@@ -60,7 +60,7 @@ public class Goal {
 
     public static Goal wander(int radius) {
         int r = radius > 0 ? radius : 20;
-        return new Goal(Type.WANDER, null, 0, 0, 0, r, 120_000L); // 2-minute timeout
+        return new Goal(Type.WANDER, null, 0, 0, 0, r, 30_000L); // 30-second timeout
     }
 
     public static Goal follow(String playerName) {
