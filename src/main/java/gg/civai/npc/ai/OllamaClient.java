@@ -62,8 +62,9 @@ public class OllamaClient {
         - "go to X Y Z" / "go there" → GOTO those coordinates
         - "stay here" / "wait" / "stop" → IDLE
         - "wander" / "explore" → WANDER
-        - conversational ("hey", "what's up", time questions) → CONVERSE that player
-        - questions about time/weather → CONVERSE + answer in speech
+        - "carry on" / "bye" / "later" / "goodbye" / "see you" / "farewell" / "go away" → WANDER (conversation is over, resume wandering)
+        - conversational ("hey", "what's up") → CONVERSE that player
+        - time/weather questions → CONVERSE + answer using the exact numbers in [QUICK FACTS] if present
 
         AUTONOMOUS BEHAVIOR (goal_completed / startup):
         - Default: WANDER radius 15-25. Vary the radius for variety.
@@ -75,6 +76,8 @@ public class OllamaClient {
         2. For threat_detected: set non-null speech (a surprised reaction). IDLE is fine as the goal.
         3. speech: max 2 short sentences. In character as a Minecraft villager.
         4. Respond with ONLY the JSON object below, nothing else.
+        5. Never repeat speech from Recent Conversation History — always say something new.
+        6. For time/weather questions: copy the exact numbers from [QUICK FACTS]. Never invent values.
 
         JSON RESPONSE FORMAT:
         {
@@ -221,6 +224,25 @@ public class OllamaClient {
                   .append(" y=").append(Math.round(mentionPlayerLoc.getY()))
                   .append(" z=").append(Math.round(mentionPlayerLoc.getZ())).append("\n");
             }
+
+            // Inject pre-computed time/weather facts when the question is about them.
+            // Placed right before the response instruction so the model copies them directly.
+            String msgLow = mentionMessage.toLowerCase();
+            boolean asksTime    = msgLow.matches(".*\\b(time|sunset|sunrise|noon|midnight|"
+                    + "how long|when is|when will|morning|afternoon|evening|night|day)\\b.*");
+            boolean asksWeather = msgLow.matches(".*\\b(weather|rain|raining|storm|thunder|"
+                    + "clear|sunny|cloudy)\\b.*");
+            if (asksTime || asksWeather) {
+                sb.append("[QUICK FACTS — copy these into your speech, do NOT invent numbers]\n");
+                sb.append("  Time of day: ").append(state.timeLabel)
+                  .append(state.isDay ? " (daytime)" : " (nighttime)").append("\n");
+                sb.append("  Weather: ").append(state.weatherState).append("\n");
+                sb.append("  Sunset in:   ").append(state.minUntilSunset).append(" real minutes\n");
+                sb.append("  Sunrise in:  ").append(state.minUntilSunrise).append(" real minutes\n");
+                sb.append("  Noon in:     ").append(state.minUntilNoon).append(" real minutes\n");
+                sb.append("  Midnight in: ").append(state.minUntilMidnight).append(" real minutes\n");
+            }
+
             sb.append("YOU MUST reply with non-null speech.\n\n");
         }
 

@@ -72,7 +72,7 @@ public class Goal {
     }
 
     public static Goal converse(String playerName) {
-        return new Goal(Type.CONVERSE, playerName, 0, 0, 0, 0, 0); // no timeout
+        return new Goal(Type.CONVERSE, playerName, 0, 0, 0, 0, 120_000L); // 2-minute idle timeout
     }
 
     // -------------------------------------------------------------------------
