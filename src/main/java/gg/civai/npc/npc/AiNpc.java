@@ -5,6 +5,7 @@ import gg.civai.npc.ai.OllamaClient;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Villager;
@@ -54,6 +55,13 @@ public class AiNpc {
     // Direct @mentions always bypass this; autonomous speech is gated here.
     private long   lastSpeechMs             = 0L;
     private static final long SPEECH_COOLDOWN_MS = 45_000L; // 45 s between unsolicited speech
+
+    // Continuous wander — when true, the game tick picks new sub-targets automatically
+    // whenever the NPC arrives at its destination, so it keeps moving without waiting
+    // for the next Ollama tick. Set by MOVE_TO (autonomous); cleared by IDLE or any
+    // player-directed action.
+    private boolean continuousWander = false;
+    private static final int WANDER_RADIUS = 14; // max blocks from current pos per sub-target
 
     // Passive chat log — written from async thread, accessed from main thread
     private final ArrayDeque<String> recentChatLog = new ArrayDeque<>(5);
@@ -243,16 +251,26 @@ public class AiNpc {
             currentActivity = action.nextActivity;
         }
 
+        // Any new AI decision resets wander mode; MOVE_TO (autonomous only) re-enables it.
+        continuousWander = false;
+
         switch (action.type) {
-            case MOVE_TO, MOVE_AND_SPEAK -> {
+            case MOVE_TO -> {
                 Location target = new Location(
                         entity.getWorld(), action.targetX, action.targetY, action.targetZ);
                 if (entity.getLocation().distance(target) < 50) {
                     targetLocation = target;
                 }
-                if (action.type == NpcAction.Type.MOVE_AND_SPEAK && action.speech != null) {
-                    trySpeak(action.speech, isDirectMessage);
+                // Autonomous MOVE_TO → keep wandering after arrival without waiting for Ollama
+                if (!isDirectMessage) continuousWander = true;
+            }
+            case MOVE_AND_SPEAK -> {
+                Location target = new Location(
+                        entity.getWorld(), action.targetX, action.targetY, action.targetZ);
+                if (entity.getLocation().distance(target) < 50) {
+                    targetLocation = target;
                 }
+                if (action.speech != null) trySpeak(action.speech, isDirectMessage);
             }
             case SPEAK, REPORT, TIME_REPORT -> {
                 if (action.speech != null) trySpeak(action.speech, isDirectMessage);
@@ -289,7 +307,10 @@ public class AiNpc {
         double dx = targetLocation.getX() - current.getX();
         double dz = targetLocation.getZ() - current.getZ();
         double xzDist = Math.sqrt(dx * dx + dz * dz);
-        if (xzDist < 0.5) return;
+        if (xzDist < 0.5) {
+            if (continuousWander) pickNextWanderTarget(); // pick next sub-target automatically
+            return;
+        }
 
         double speed = 0.2;
         double scale = Math.min(speed, xzDist) / xzDist;
@@ -329,11 +350,16 @@ public class AiNpc {
         Block head  = w.getBlockAt(bx, byFeet + 1, bz);
         Block under = w.getBlockAt(bx, byFeet - 1, bz);
 
+        // Never enter liquid — water is isPassable()=true in Bukkit, so must check explicitly
+        if (isLiquid(foot) || isLiquid(head)) return Double.NaN;
+
         if (foot.isPassable() && head.isPassable()) {
             // Path is clear — check if ground dropped away
             if (under.isPassable()) {
                 // Ground dropped; find solid surface
                 int groundY = w.getHighestBlockYAt(bx, bz);
+                // Don't step down into a lake or lava pool
+                if (isLiquid(w.getBlockAt(bx, groundY, bz))) return Double.NaN;
                 return groundY + 1.0;
             }
             return currentY; // flat or slight terrain, keep Y
@@ -342,11 +368,49 @@ public class AiNpc {
         // Foot is blocked — try stepping up one block
         Block stepFoot = w.getBlockAt(bx, byFeet + 1, bz);
         Block stepHead = w.getBlockAt(bx, byFeet + 2, bz);
-        if (stepFoot.isPassable() && stepHead.isPassable()) {
+        if (stepFoot.isPassable() && stepHead.isPassable()
+                && !isLiquid(stepFoot) && !isLiquid(stepHead)) {
             return byFeet + 1.0;
         }
 
         return Double.NaN; // completely blocked
+    }
+
+    /**
+     * Picks a random nearby point as the next wander sub-target.
+     * Tries up to 8 candidates; skips any that land on liquid or a steep cliff.
+     * Called from the game tick — runs on the main thread.
+     */
+    private void pickNextWanderTarget() {
+        if (entity == null || !entity.isValid()) return;
+        Location loc = entity.getLocation();
+        World    w   = loc.getWorld();
+
+        for (int attempt = 0; attempt < 8; attempt++) {
+            double angle = Math.random() * 2 * Math.PI;
+            double dist  = 4 + Math.random() * WANDER_RADIUS;
+            int    nx    = (int) Math.floor(loc.getX() + Math.cos(angle) * dist);
+            int    nz    = (int) Math.floor(loc.getZ() + Math.sin(angle) * dist);
+            int    ny    = w.getHighestBlockYAt(nx, nz); // top solid/liquid surface
+
+            // Reject liquid surfaces (lake, ocean, lava)
+            if (isLiquid(w.getBlockAt(nx, ny, nz))) continue;
+            // Reject steep drops or climbs (> 5 blocks from current Y)
+            if (Math.abs(ny - loc.getBlockY()) > 5) continue;
+
+            targetLocation = new Location(w, nx + 0.5, ny + 1.0, nz + 0.5);
+            return;
+        }
+        // All candidates rejected — stop wandering until next Ollama tick decides
+        continuousWander = false;
+    }
+
+    /** Returns true for blocks the NPC should never step into or onto. */
+    private static boolean isLiquid(Block b) {
+        return switch (b.getType()) {
+            case WATER, LAVA, BUBBLE_COLUMN -> true;
+            default -> false;
+        };
     }
 
     // -------------------------------------------------------------------------
