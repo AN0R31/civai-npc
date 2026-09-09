@@ -46,6 +46,15 @@ public class AiNpc {
     private NpcAction            currentAction = NpcAction.idle("Just spawned.");
     private final ConversationMemory memory    = new ConversationMemory(10);
 
+    // Persistent activity — what the NPC is currently doing between AI ticks.
+    // Fed back into the prompt each tick so the NPC has continuity of purpose.
+    private String currentActivity = "just arrived, looking around";
+
+    // Speech cooldown — prevents the NPC from narrating its existence every 10 s.
+    // Direct @mentions always bypass this; autonomous speech is gated here.
+    private long   lastSpeechMs             = 0L;
+    private static final long SPEECH_COOLDOWN_MS = 45_000L; // 45 s between unsolicited speech
+
     // Passive chat log — written from async thread, accessed from main thread
     private final ArrayDeque<String> recentChatLog = new ArrayDeque<>(5);
 
@@ -159,9 +168,11 @@ public class AiNpc {
      */
     private void runThink(String directPlayerName, String directMessage, Location directPlayerLoc) {
         thinkingLock = true;
+        boolean isDirect = directPlayerName != null;
 
-        // Snapshot chat log on main thread
-        List<String> chatSnapshot = new ArrayList<>(recentChatLog);
+        // Snapshot mutable state on main thread before going async
+        List<String> chatSnapshot    = new ArrayList<>(recentChatLog);
+        String       activitySnapshot = currentActivity;
 
         WorldState state = new WorldState(
                 entity.getLocation(), scanRadius, name,
@@ -170,16 +181,18 @@ public class AiNpc {
         // Async: call Ollama (blocking HTTP)
         plugin.getServer().getScheduler().runTaskAsynchronously(plugin, () -> {
             NpcAction action = ollamaClient.think(
-                    state, memory, directPlayerName, directMessage, directPlayerLoc);
-            logger.info("[" + name + "] thought: " + action.thought
+                    state, memory, directPlayerName, directMessage, directPlayerLoc,
+                    activitySnapshot);
+            logger.info("[" + name + "] activity: " + activitySnapshot
+                    + " → " + action.nextActivity
                     + " | action: " + action.type
                     + (action.speech != null ? " | speech: \"" + action.speech + "\"" : ""));
 
             // Back on main thread: apply + record in memory + drain any queued @mention
             plugin.getServer().getScheduler().runTask(plugin, () -> {
-                applyAction(action);
+                applyAction(action, isDirect);
 
-                if (directPlayerName != null && action.speech != null) {
+                if (isDirect && action.speech != null) {
                     memory.add(directPlayerName, directMessage, action.speech);
                 }
 
@@ -222,8 +235,13 @@ public class AiNpc {
     // Action execution
     // -------------------------------------------------------------------------
 
-    private void applyAction(NpcAction action) {
+    private void applyAction(NpcAction action, boolean isDirectMessage) {
         currentAction = action;
+
+        // Update persistent activity descriptor for next tick
+        if (action.nextActivity != null && !action.nextActivity.isBlank()) {
+            currentActivity = action.nextActivity;
+        }
 
         switch (action.type) {
             case MOVE_TO, MOVE_AND_SPEAK -> {
@@ -233,16 +251,30 @@ public class AiNpc {
                     targetLocation = target;
                 }
                 if (action.type == NpcAction.Type.MOVE_AND_SPEAK && action.speech != null) {
-                    speak(action.speech);
+                    trySpeak(action.speech, isDirectMessage);
                 }
             }
             case SPEAK, REPORT, TIME_REPORT -> {
-                if (action.speech != null) speak(action.speech);
+                if (action.speech != null) trySpeak(action.speech, isDirectMessage);
             }
             case IDLE -> {
-                // stay put
+                // stay put — most common autonomous state
             }
         }
+    }
+
+    /**
+     * Speaks out loud, enforcing a cooldown on autonomous (non-directed) speech.
+     * Direct @mention responses always bypass the cooldown.
+     */
+    private void trySpeak(String message, boolean isDirectMessage) {
+        long now = System.currentTimeMillis();
+        if (!isDirectMessage && (now - lastSpeechMs) < SPEECH_COOLDOWN_MS) {
+            logger.fine("[" + name + "] speech suppressed (cooldown): " + message);
+            return;
+        }
+        speak(message);
+        lastSpeechMs = now;
     }
 
     // -------------------------------------------------------------------------
