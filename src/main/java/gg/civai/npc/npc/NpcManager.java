@@ -135,14 +135,28 @@ public class NpcManager implements Listener {
         String   message   = PlainTextComponentSerializer.plainText().serialize(event.message());
         Location playerLoc = player.getLocation();
 
-        String  tag    = "@" + npcName;
-        boolean direct = message.toLowerCase().startsWith(tag.toLowerCase());
+        // Support partial @mention: "@steve" matches NPC named "SuperSteve"
+        // Extract the word after '@' and check if npcName contains it (min 3 chars).
+        String  lower     = message.toLowerCase();
+        String  npcLower  = npcName.toLowerCase();
+        boolean direct    = false;
+        String  stripped  = message;
+
+        if (lower.startsWith("@")) {
+            int end = 1;
+            while (end < lower.length() && Character.isLetterOrDigit(lower.charAt(end))) end++;
+            String mentioned = lower.substring(1, end); // word after '@'
+            if (mentioned.length() >= 3 && npcLower.contains(mentioned)) {
+                direct   = true;
+                stripped = message.substring(end).trim();
+            }
+        }
 
         if (direct) {
-            String stripped = message.substring(tag.length()).trim();
+            final String msg = stripped;
             for (AiNpc npc : npcs) {
                 if (!npc.isValid()) continue;
-                npc.triggerImmediateResponse(player.getName(), stripped, playerLoc);
+                npc.triggerImmediateResponse(player.getName(), msg, playerLoc);
             }
         } else {
             String logEntry = "[" + player.getName() + "]: " + message;
